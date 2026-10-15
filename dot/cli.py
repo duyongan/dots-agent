@@ -344,13 +344,22 @@ def _cmd_doctor(args) -> int:
 def _cmd_ls(conn, status) -> int:
     goals = db.list_goals(conn, status, limit=100)
     if not goals:
-        print("还没有目标。python -m dot goal \"...\" 下一个。")
+        print('还没有目标。python -m dot goal "..." 下一个。')
         return 0
+
+    # 等审批的目标直接把编号摊在列表里 —— 不然你还得去 log 里翻,
+    # 或者更糟:自己写 SQL 查。
+    waiting = {a["goal_id"]: a["token"] for a in db.pending_approvals(conn)}
     rows = [
-        (g["id"], g["status"], _n(g["tokens"]), _ago(g["updated_at"]), g["text"][:48])
+        (g["id"], g["status"], waiting.get(g["id"], ""), _n(g["tokens"]),
+         _ago(g["updated_at"]), g["text"][:44])
         for g in goals
     ]
-    print(_table(rows, ("ID", "STATUS", "TOKENS", "UPDATED", "TEXT")))
+    print(_table(rows, ("ID", "STATUS", "TOKEN", "TOKENS", "UPDATED", "TEXT")))
+    if waiting:
+        tokens = " ".join(sorted(waiting.values()))
+        print(f"\n{len(waiting)} 个在等你。批准:dot approve <编号>   拒绝:dot reject <编号>")
+        print(f"编号:{tokens}")
     return 0
 
 
