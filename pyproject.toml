@@ -1,7 +1,7 @@
 [project]
 name = "dots-agent"
 dynamic = ["version"]
-description = "常驻主动式 agent —— 给一个目标,它自己在后台推"
+description = "一个会主动发现任务的智能体"
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
