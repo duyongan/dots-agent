@@ -10,6 +10,13 @@
 pip install dots-agent
 ```
 
+> 国内镜像(清华、阿里等)同步新包有延迟,刚发布的几天可能报
+> `No matching distribution found`。加官方源即可:
+>
+> ```bash
+> pip install dots-agent -i https://pypi.org/simple
+> ```
+
 或者不装,直接在仓库里跑(两种方式命令都通用):
 
 ```bash
