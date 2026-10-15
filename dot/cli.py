@@ -414,9 +414,16 @@ def _cmd_cost(conn, cfg) -> int:
 
 
 def _cmd_selftest() -> int:
-    """不联网、不调模型。只验证纯逻辑和数据流,几秒钟出结果。"""
+    """不联网、不调模型。
+
+    分两档:
+      内置的几条 —— 永远跑,装完 pip 的人也能验证依赖和纯逻辑没坏。
+      完整套件 —— 只在源码仓库里有(wheel 不带 tests/),含假 IMAP 服务器、
+                    交接、审批闭环那些。
+    硬要两层都跑会逼着把 tests/ 打进 wheel,那不值得:
+    用户要的是「我这套装得对不对」,开发者要的才是那 19 条断言。
+    """
     from dot import sources
-    from tests import test_sources, test_web
 
     print("== rules ==")
     rules_mod.demo()
@@ -426,10 +433,20 @@ def _cmd_selftest() -> int:
     approvals.demo()
     print("== skills ==")
     skills_mod.demo()
+
+    try:
+        from tests import test_loop, test_sources, test_web
+    except ImportError:
+        print("\n内置自检通过。")
+        print("完整套件(本地假 IMAP 服务器 / 假模型跑 tick / 活动视图)在源码仓库里:")
+        print("  git clone https://github.com/duyongan/dots-agent")
+        print("  cd dots-agent && python -m dot selftest")
+        return 0
+
     print("== 事件源(本地假服务)==")
     print(test_sources.run())
     print("== 一轮 tick(用假模型)==")
-    print(graph_loop_demo())
+    print(test_loop.run())
     print("== 活动视图 ==")
     print(test_web.run())
     print("\n自检通过。")
@@ -482,13 +499,6 @@ def _ago(ts) -> str:
     if d < 86400:
         return f"{d // 3600}h"
     return f"{d // 86400}d"
-
-
-def graph_loop_demo() -> str:
-    """端到端跑一轮 tick,模型用假的。真逻辑,假嘴。"""
-    from tests.test_loop import run
-
-    return run()
 
 
 if __name__ == "__main__":
