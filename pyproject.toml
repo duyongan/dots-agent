@@ -22,6 +22,11 @@ dependencies = [
     "deepagents>=0.6",
     "langgraph-checkpoint-sqlite>=2.0",
     "python-dateutil>=2.8",
+    # deepagents 只带 langchain-anthropic 和 langchain-google-genai,
+    # 不带这个。而 dot init 自动探测首推的是 DeepSeek —— 走 openai: 协议。
+    # 少这一行,README 里那条主路径装完就 ImportError。
+    # 一个包换来 DeepSeek / Kimi / 通义 / 智谱 / 豆包 / 硅基流动 / OpenAI 全能跑。
+    "langchain-openai>=0.3",
 ]
 
 [project.optional-dependencies]
