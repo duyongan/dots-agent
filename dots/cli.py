@@ -184,7 +184,7 @@ def _cmd_repl(args) -> int:
     # 重定向到文件或管道时不画 —— 那玩意儿是给人看的,不是给日志看的
     if sys.stdout.isatty():
         print(banner())
-        print(f"  v{__version__} · 一个会主动发现任务的智能体\n")
+        print(f"  v{__version__} · 一个会主动发现任务、主动积累技能的智能体\n")
 
     print("直接打字 = 和它说话;/ 开头是命令(/help 看全部,/goal 交给后台跑)。")
     found = config_mod.resolve(args.config)

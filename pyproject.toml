@@ -1,7 +1,7 @@
 [project]
 name = "dots-agent"
 dynamic = ["version"]
-description = "一个会主动发现任务的智能体"
+description = "一个会主动发现任务、主动积累技能的智能体"
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
