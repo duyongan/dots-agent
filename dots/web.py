@@ -14,7 +14,7 @@ import threading
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from dot import db
+from dots import db
 
 CSS = """
 *{box-sizing:border-box}
@@ -64,10 +64,10 @@ def render(conn) -> str:
     audit = db.recent_audit(conn, 60)
 
     parts = [f"<!doctype html><html><head><meta charset='utf-8'>",
-             f"<title>dot</title>",
+             f"<title>dots</title>",
              f"<meta http-equiv='refresh' content='10'>",
              f"<style>{CSS}</style></head><body>"]
-    parts.append(f"<h1>dot</h1>")
+    parts.append(f"<h1>dots</h1>")
     parts.append(
         f"<div class='sub'>{len(goals)} 个目标 · "
         f"{len(pending)} 个待批 · "
@@ -89,8 +89,8 @@ def render(conn) -> str:
         parts.append("</table>")
         parts.append(
             "<div class='sub' style='margin-top:8px'>"
-            "批准:<code>python -m dot approve &lt;编号&gt;</code> · "
-            "拒绝:<code>python -m dot reject &lt;编号&gt;</code></div>"
+            "批准:<code>python -m dots approve &lt;编号&gt;</code> · "
+            "拒绝:<code>python -m dots reject &lt;编号&gt;</code></div>"
         )
     else:
         parts.append("<div class='empty'>没有等着你的动作。</div>")
@@ -165,7 +165,7 @@ def start(db_path, port: int = 8765, host: str = "127.0.0.1") -> ThreadingHTTPSe
         server = ThreadingHTTPServer((host, port), make_handler(db_path))
     except OSError as e:
         raise SystemExit(
-            f"活动视图起不来({host}:{port}):{e}\n换个端口:python -m dot serve --web --web-port 8899"
+            f"活动视图起不来({host}:{port}):{e}\n换个端口:python -m dots serve --web --web-port 8899"
         )
     thread = threading.Thread(target=server.serve_forever, name="dot-web", daemon=True)
     thread.start()

@@ -150,7 +150,7 @@ def remove(cfg, name: str) -> bool:
 
 
 def demo() -> None:
-    """python -m dot.skills 直接跑。"""
+    """python -m dots.skills 直接跑。"""
     assert validate("summarize-inbox", "Turn a dropped file into an action list.") is None
     assert validate("Summarize Inbox", "x.") is not None          # 有空格和大写
     assert validate("a--b", "x.") is not None                     # 连续连字符

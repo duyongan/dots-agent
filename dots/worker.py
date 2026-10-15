@@ -22,7 +22,7 @@ from datetime import datetime
 from langchain_core.messages import HumanMessage
 from langgraph.types import Command
 
-from dot import approvals, db, graph, skills as skills_mod, sources
+from dots import approvals, db, graph, skills as skills_mod, sources
 
 
 # ------------------------------------------------------------------- 一轮 tick
@@ -43,7 +43,7 @@ def tick(cfg, conn, agents, *, dry_run: bool = False) -> dict:
         "resumed": 0, "ran": 0, "interrupted": 0, "failed": 0,
         "handoffs": 0, "skipped": 0, "paused": None,
     }
-    # tick 可以脱离 serve 单独跑(测试和 `dot tick` 都走这条路)
+    # tick 可以脱离 serve 单独跑(测试和 `dots tick` 都走这条路)
     if graph.CURRENT is None:
         graph.CURRENT = graph.RunCtx(cfg=cfg, conn=conn)
 
@@ -383,9 +383,9 @@ def serve(cfg, conn, *, dry_run: bool = False, once: bool = False,
     if web:
         if once:
             print("[dot] --once 配 --web 没意义:跑完就退,页面也跟着没了。"
-                  "要看活动视图请用 python -m dot serve --web", file=sys.stderr)
+                  "要看活动视图请用 python -m dots serve --web", file=sys.stderr)
         else:
-            from dot import web as web_mod
+            from dots import web as web_mod
 
             web_mod.start(cfg.db, port=web_port)
     agents = build_agents(cfg, conn)
@@ -398,7 +398,7 @@ def serve(cfg, conn, *, dry_run: bool = False, once: bool = False,
     print(f"[dot] bot:{', '.join(sorted(cfg.bots))}"
           + (f"  技能:{len(skills_mod.scan(cfg))} 个" if cfg.skills.enabled else ""))
     if not cfg.smtp.usable:
-        print("[dot] 没配 [smtp],审批会退回 CLI:python -m dot approve <token>")
+        print("[dot] 没配 [smtp],审批会退回 CLI:python -m dots approve <token>")
     while True:
         try:
             stats = tick(cfg, conn, agents, dry_run=dry_run)

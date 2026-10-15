@@ -23,7 +23,7 @@ from urllib.request import urlopen
 from dateutil.rrule import rrulestr
 from dateutil.tz import gettz
 
-from dot import db
+from dots import db
 
 
 @dataclass

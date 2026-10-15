@@ -7,9 +7,30 @@ import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from dot.prompts import BOT_PROMPTS
+from dots.prompts import BOT_PROMPTS
 
 DEFAULT_FILENAME = "dot.toml"
+
+# 全局配置,`dots init --global` 写这里。
+# workspace / db 都相对配置所在目录,所以全局那份的数据落在 ~/.dots/ 底下 ——
+# 一份数据,cd 到哪都跟着走,不用每个目录再 init 一遍。
+GLOBAL_DIR = Path.home() / ".dots"
+GLOBAL_PATH = GLOBAL_DIR / DEFAULT_FILENAME
+
+
+def resolve(path: str | Path | None = None) -> Path | None:
+    """按 `显式路径 > ./dot.toml > ~/.dots/dot.toml` 找配置,都没有返回 None。
+
+    显式给了路径就不兜底:`-c tyop.toml` 打错字却默默用了全局配置,
+    比直接报错难查得多。
+    """
+    if path is not None:
+        p = Path(path)
+        return p if p.exists() else None
+    for candidate in (Path(DEFAULT_FILENAME), GLOBAL_PATH):
+        if candidate.exists():
+            return candidate
+    return None
 
 # 环境变量 -> 开箱可用的模型配置。按顺序探测,第一个命中就用它。
 # 三件套(name / base_url / api_key_env)都在这里定好,init 时直接写进 dot.toml。
@@ -172,13 +193,18 @@ def _path(root: Path, value: str) -> Path:
     return p if p.is_absolute() else root / p
 
 
-def load(path: str | Path = DEFAULT_FILENAME) -> Config:
+def load(path: str | Path | None = None) -> Config:
     """找不到配置文件时给一句能看懂的报错,而不是 FileNotFoundError 堆栈。"""
-    p = Path(path)
-    if not p.exists():
+    if path is not None and not Path(path).exists():
+        raise SystemExit(f"找不到配置文件 {path}。")
+
+    p = resolve(path)
+    if p is None:
         raise SystemExit(
-            f"找不到配置文件 {p}。\n"
-            f"在项目根目录跑 `python -m dot init` 生成一份,或加 --config 指定路径。"
+            "没找到配置。两种做法:\n"
+            "  dots init --global    配一次,以后在任何目录敲 dots 都能用\n"
+            "  dots init             只在这个目录用,数据和 workspace 都放这儿\n"
+            "也可以用 -c 指定一份配置。"
         )
     try:
         raw = tomllib.loads(p.read_text(encoding="utf-8"))

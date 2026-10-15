@@ -2,7 +2,7 @@
 
 这是那「一个能跑的检查」。逻辑一坏它就红,不需要 API key,几秒钟出结果:
     python -m pytest tests/ -q
-    python -m dot selftest
+    python -m dots selftest
 """
 
 from __future__ import annotations
@@ -14,7 +14,7 @@ from types import SimpleNamespace
 from langchain_core.messages import AIMessage
 from langgraph.types import Command
 
-from dot import db, graph, skills as skills_mod, worker
+from dots import db, graph, skills as skills_mod, worker
 
 
 # ------------------------------------------------------------------ 假模型
@@ -408,13 +408,13 @@ def test_loop():
 
 
 def test_rules():
-    from dot import rules
+    from dots import rules
 
     rules.demo()
 
 
 def test_approvals_parse():
-    from dot import approvals
+    from dots import approvals
 
     approvals.demo()
 

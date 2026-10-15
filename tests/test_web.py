@@ -16,7 +16,7 @@ import tempfile
 import urllib.error
 import urllib.request
 
-from dot import db, web
+from dots import db, web
 
 _TEMP_DBS: list[tuple[object, str]] = []
 

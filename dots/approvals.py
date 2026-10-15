@@ -14,7 +14,7 @@ import smtplib
 import sys
 from email.message import EmailMessage
 
-from dot import db
+from dots import db
 
 APPROVE_WORDS = {"y", "yes", "ok", "okay", "approve", "approved", "同意", "批准", "是", "可以", "准"}
 REJECT_WORDS = {"n", "no", "reject", "rejected", "deny", "denied", "拒绝", "否", "不要", "不行", "驳回"}
@@ -83,7 +83,7 @@ def send(cfg, conn, goal_id: str, payload: dict, *, dry_run: bool = False) -> st
         reason = "dry-run" if dry_run else "没配 [smtp]"
         print(f"\n[dot] 需要你批准({reason},已记入待批队列)")
         print(f"      主题: {subject}")
-        print(f"      替代做法: python -m dot approve {token}\n", file=sys.stderr)
+        print(f"      替代做法: python -m dots approve {token}\n", file=sys.stderr)
         return token
 
     try:
@@ -93,7 +93,7 @@ def send(cfg, conn, goal_id: str, payload: dict, *, dry_run: bool = False) -> st
         db.audit(conn, goal_id, "approval_send_failed", f"{token}: {type(e).__name__}: {e}")
         print(
             f"[dot] 审批邮件发不出去({type(e).__name__}: {e})。\n"
-            f"      用 CLI 顶一下: python -m dot approve {token}",
+            f"      用 CLI 顶一下: python -m dots approve {token}",
             file=sys.stderr,
         )
     return token
@@ -151,7 +151,7 @@ def _body_text(token: str, tool: str, args: dict) -> str:
         "  回 n 或 拒绝   → 不执行",
         "",
         "只认第一行。其他回复会被忽略(不会产生新目标)。",
-        "不确定它想干什么,就先 python -m dot log 看一眼。",
+        "不确定它想干什么,就先 python -m dots log 看一眼。",
     ]
     return "\n".join(lines)
 

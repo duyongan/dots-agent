@@ -2,7 +2,7 @@
 
 一个会主动发现任务的智能体。
 
-包名 `dots-agent`,命令是 `dot`(装完就有)。
+包名 `dots-agent`,命令是 `dots`(装完就有)。
 
 ## 安装
 
@@ -22,52 +22,73 @@ pip install dots-agent
 ```bash
 git clone https://github.com/duyongan/dots-agent
 cd dots-agent
-python -m dot serve
+python -m dots serve
 ```
 
 ## 快速开始
 
 ```bash
-dot init                  # 生成 dot.toml,自动探测你环境里的 API key
-dot doctor                # 体检一下
-dot goal "把 inbox 里的东西整理成一份报告"
-dot serve --web           # 常驻跑起来,同时开活动视图
+dots init --global         # 配一次,以后 cd 到哪都能敲 dots
+dots doctor                # 体检一下
+dots goal "把 inbox 里的东西整理成一份报告"
+dots serve --web           # 常驻跑起来,同时开活动视图
 ```
+
+`--global` 把配置写到 `~/.dots/`,数据和 `workspace/` 也跟着放那儿 ——
+一份到处用,换个目录不用再 init。不带参数就是 `dots init`,只写当前目录,
+那样每个目录都得配一次。
+
+也可以不带子命令,直接进交互终端 —— 命令行里那些命令在这里都能敲:
+
+```
+$ dots
+dots> goal "把 inbox 里的东西整理成一份报告"
+dots> ls
+dots> log -n 20
+dots> exit
+```
+
+`help` 看命令,`exit` 或 Ctrl-D 退出。每一行都重新读 `dot.toml`,
+所以改了配置不用退出来重进。
 
 打开 http://127.0.0.1:8765/ 看它在干什么。
 
 想先不配模型试一遍:
 
 ```bash
-dot selftest              # 不联网、不调模型
+dots selftest              # 不联网、不调模型
 ```
 
 ## 命令
 
 | 命令 | 干什么 |
 |---|---|
-| `dot init` | 在当前目录生成 `dot.toml`,扫环境变量自动配好 `[model]` |
-| `dot doctor` | 体检:配置、密钥、模型、目录、数据库、事件源逐项查 |
-| `dot goal "..."` | 下一个目标。`--bot <名>` 指定交给谁做 |
-| `dot serve` | 常驻跑。`--web` 开活动视图,`--once` 只跑一轮,`--dry-run` 不真发邮件 |
-| `dot tick` | 手动跑一轮就退(调试用) |
-| `dot ls` | 列目标。`--status <状态>` 过滤 |
-| `dot log` | 活动流水。`-n 50` 条数,`--goal <id>` 只看一个 |
-| `dot approve <token>` | 批准一个挂起的动作 |
-| `dot reject <token>` | 拒绝一个挂起的动作 |
-| `dot cost` | token 用量 |
-| `dot learn "..."` | 把一段材料总结成技能 |
-| `dot skills` | 列出技能库 |
-| `dot skill show <名>` | 看技能正文 |
-| `dot skill rm <名>` | 删掉技能 |
-| `dot curate` | 让 agent 整理技能库:合并重复、删掉没价值的 |
-| `dot selftest` | 不联网不调模型跑一遍自检 |
+| `dots` | 不带子命令 = 进交互终端。命令照常敲,`help` / `exit` |
+| `dots init` | 生成 `dot.toml`,扫环境变量自动配好 `[model]`。`--global` 写到 `~/.dots/` |
+| `dots doctor` | 体检:配置、密钥、模型、目录、数据库、事件源逐项查 |
+| `dots goal "..."` | 下一个目标。`--bot <名>` 指定交给谁做 |
+| `dots serve` | 常驻跑。`--web` 开活动视图,`--once` 只跑一轮,`--dry-run` 不真发邮件 |
+| `dots tick` | 手动跑一轮就退(调试用) |
+| `dots ls` | 列目标。`--status <状态>` 过滤 |
+| `dots log` | 活动流水。`-n 50` 条数,`--goal <id>` 只看一个 |
+| `dots approve <token>` | 批准一个挂起的动作 |
+| `dots reject <token>` | 拒绝一个挂起的动作 |
+| `dots cost` | token 用量 |
+| `dots learn "..."` | 把一段材料总结成技能 |
+| `dots skills` | 列出技能库 |
+| `dots skill show <名>` | 看技能正文 |
+| `dots skill rm <名>` | 删掉技能 |
+| `dots curate` | 让 agent 整理技能库:合并重复、删掉没价值的 |
+| `dots selftest` | 不联网不调模型跑一遍自检 |
 
-全局参数:`-c, --config <路径>`,默认 `./dot.toml`。
+找配置的顺序:**`-c` 指定的路径 → 当前目录的 `./dot.toml` → `~/.dots/dot.toml`**。
+到处能用靠的是最后一个,`dots init --global` 才会写它。
+
+`-c` 指了路径就不会再往下兜底 —— 写错名字直接报错,不会偷偷用上全局那份。
 
 ## 配置
 
-`dot init` 生成一份 `dot.toml`,所有相对路径都相对这个文件所在目录。
+`dots init` 生成一份 `dot.toml`,所有相对路径都相对这个文件所在目录。
 **密钥只写环境变量名,不写进文件。**
 
 ### `[dot]`
@@ -81,7 +102,7 @@ db = "dot.db"
 
 ### `[model]`
 
-`dot init` 会自动探测,一般不用手改。支持的 key:
+`dots init` 会自动探测,一般不用手改。支持的 key:
 
 DeepSeek / Kimi / 通义 / 智谱 / 豆包 / 硅基流动 / Claude / OpenAI / Gemini。
 
@@ -98,7 +119,7 @@ temperature = 0.2
 
 ### `[smtp]`
 
-审批邮件和汇报从这里发出去。不配也能跑,审批退化成 `dot approve`。
+审批邮件和汇报从这里发出去。不配也能跑,审批退化成 `dots approve`。
 
 ```toml
 [smtp]
@@ -198,8 +219,8 @@ daily_token_budget = 0   # 0 = 不限。填了数字,超了当天就不再跑新
 
 ```bash
 printf '把这三件事排个优先级\n- 修打印机\n- 回邮件\n- 整理数据\n' > workspace/inbox/todo.txt
-dot tick
-dot ls
+dots tick
+dots ls
 ```
 
 ### 用邮件审批
@@ -213,17 +234,17 @@ dot ls
 
 **回复这封邮件**,第一行写 `y` / `同意` 或 `n` / `拒绝` 即可。
 
-没配邮件也能用 CLI。`dot ls` 会把等审批的目标和编号直接列出来:
+没配邮件也能用 CLI。`dots ls` 会把等审批的目标和编号直接列出来:
 
 ```bash
-dot ls
+dots ls
 # ID      STATUS       TOKEN  TOKENS  UPDATED  TEXT
 # 43e86d  interrupted  a7f3   29,047  12s      给 alice 发一封邮件...
 #
-# 1 个在等你。批准:dot approve <编号>   拒绝:dot reject <编号>
+# 1 个在等你。批准:dots approve <编号>   拒绝:dots reject <编号>
 
-dot log --goal 43e86d         # 先看它到底想干什么
-dot approve a7f3
+dots log --goal 43e86d         # 先看它到底想干什么
+dots approve a7f3
 ```
 
 ### 攒技能
@@ -231,9 +252,9 @@ dot approve a7f3
 它干活的时候会自己把可复用的流程记下来。你也可以喂材料:
 
 ```bash
-dot learn "workspace/weekly-template.md 里的周报模板,以后按这个格式写周报"
-dot tick
-dot skills
+dots learn "workspace/weekly-template.md 里的周报模板,以后按这个格式写周报"
+dots tick
+dots skills
 ```
 
 技能存在 `workspace/skills/<名>/SKILL.md`,是普通 markdown 文件,可以手改。
@@ -241,15 +262,15 @@ dot skills
 ### 交接给别的 bot
 
 ```bash
-dot goal --bot ops "把报告发给 alice"
+dots goal --bot ops "把报告发给 alice"
 ```
 
-跑起来之后它也能自己换人,你在 `dot log` 里会看到 `handoff` 那一条。
+跑起来之后它也能自己换人,你在 `dots log` 里会看到 `handoff` 那一条。
 
 ### 看活动视图
 
 ```bash
-dot serve --web --web-port 8765
+dots serve --web --web-port 8765
 ```
 
 三张表:待批准、目标(带结论和证据)、最近的流水。10 秒自刷新。
@@ -258,7 +279,7 @@ dot serve --web --web-port 8765
 ### 常驻跑
 
 ```bash
-dot serve
+dots serve
 ```
 
 Ctrl-C 停。没跑完的目标留在库里,下次启动接着跑。
@@ -267,7 +288,7 @@ Ctrl-C 停。没跑完的目标留在库里,下次启动接着跑。
 
 每次运行都会重新过一遍系统提示和工具描述,固定开销不小 —— 往 `inbox/`
 扔一个文件大约几万 token 起。先让 `daily_token_budget = 0` 跑一天,
-用 `dot cost` 看真实数字,再决定填多少。
+用 `dots cost` 看真实数字,再决定填多少。
 
 ## 许可
 

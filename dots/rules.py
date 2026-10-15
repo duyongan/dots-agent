@@ -50,7 +50,7 @@ def _norm(value: str, action: str) -> str:
 
 
 def demo() -> None:
-    """python -m dot.rules 直接跑这个。"""
+    """python -m dots.rules 直接跑这个。"""
     r = {"send_email": "ask", "run_shell": "deny", "fs_*": "allow"}
     assert decide("send_email", r) == ASK
     assert decide("run_shell", r) == DENY

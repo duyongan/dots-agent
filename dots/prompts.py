@@ -105,7 +105,7 @@ Author the skill the way a maintainer would review it:
      valuable section; skip it only if there genuinely were none.
 """
 
-# `dot learn` 用的提示。用户给一段材料或一句描述,让 agent 自己总结成技能。
+# `dots learn` 用的提示。用户给一段材料或一句描述,让 agent 自己总结成技能。
 LEARN_PROMPT = """\
 你的任务:把下面这个东西总结成一份技能,存进技能库。
 
@@ -126,7 +126,7 @@ LEARN_PROMPT = """\
 技能库目录是 `{dir}/`,每个技能一个子目录。
 """
 
-# `dot curate` 用的提示。整理技能库,合并重复、删掉没价值的。
+# `dots curate` 用的提示。整理技能库,合并重复、删掉没价值的。
 CURATE_PROMPT = """\
 整理技能库。工作区里 `{dir}/` 下每个子目录是一份技能,里面有 SKILL.md。
 

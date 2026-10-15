@@ -27,7 +27,7 @@ from ipaddress import IPv4Address
 from pathlib import Path
 from types import SimpleNamespace
 
-from dot import sources
+from dots import sources
 
 
 # ===================================================== 自签证书 + 假 IMAP 服务
@@ -385,7 +385,7 @@ _TEMP_DBS: list[tuple[object, str]] = []
 
 
 def _quiet_conn():
-    from dot import db
+    from dots import db
 
     fd, path = tempfile.mkstemp(suffix=".db")
     os.close(fd)

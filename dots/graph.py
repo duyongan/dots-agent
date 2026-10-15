@@ -24,10 +24,10 @@ from langchain.chat_models import init_chat_model
 from langchain_core.tools import tool
 from langgraph.types import interrupt
 
-from dot import approvals, db
-from dot import rules as rules_mod
-from dot import skills as skills_mod
-from dot.prompts import SCOUT_PROMPT, SYSTEM_PROMPT
+from dots import approvals, db
+from dots import rules as rules_mod
+from dots import skills as skills_mod
+from dots.prompts import SCOUT_PROMPT, SYSTEM_PROMPT
 
 SHELL_TIMEOUT = 120
 

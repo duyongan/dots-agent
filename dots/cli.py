@@ -1,35 +1,40 @@
 """命令行。
 
 CLI 只往 SQLite 写东西,不跟 daemon 通信 —— 没有 socket,没有 IPC。
-`dot goal` 插一行 goals,`dot approve` 改一行 approvals,常驻进程下一轮自己就看见了。
+`dots goal` 插一行 goals,`dots approve` 改一行 approvals,常驻进程下一轮自己就看见了。
 """
 
 from __future__ import annotations
 
 import argparse
+import shlex
 import sys
 import unicodedata
 from datetime import datetime
 from pathlib import Path
 
-from dot import approvals, db
-from dot import config as config_mod
-from dot import graph as graph_mod
-from dot import rules as rules_mod
-from dot import skills as skills_mod
-from dot import worker
-from dot.prompts import CURATE_PROMPT, LEARN_PROMPT
+from dots import __version__
+from dots import approvals, db
+from dots import config as config_mod
+from dots import graph as graph_mod
+from dots import rules as rules_mod
+from dots import skills as skills_mod
+from dots import worker
+from dots.prompts import CURATE_PROMPT, LEARN_PROMPT
 
 
-def main(argv=None) -> int:
+def _parser() -> argparse.ArgumentParser:
+    """命令表。交互终端和命令行共用这一份,免得有两套说法。"""
     p = argparse.ArgumentParser(
-        prog="dot", description="常驻主动式 agent。给一个目标,它自己在后台推。"
+        prog="dots", description="常驻主动式 agent。给一个目标,它自己在后台推。"
     )
-    p.add_argument("-c", "--config", default=config_mod.DEFAULT_FILENAME,
-                   help="配置文件路径(默认 ./dot.toml)")
-    sub = p.add_subparsers(dest="cmd", required=True)
+    p.add_argument("-c", "--config", default=None,
+                   help="配置文件路径(默认先找 ./dot.toml,再找 ~/.dots/dot.toml)")
+    sub = p.add_subparsers(dest="cmd")
 
-    sub.add_parser("init", help="在当前目录生成一份 dot.toml(自动探测模型)")
+    ini = sub.add_parser("init", help="生成一份 dot.toml(自动探测模型)")
+    ini.add_argument("--global", dest="global_", action="store_true",
+                     help=f"写到 {config_mod.GLOBAL_PATH},之后在任何目录敲 dots 都能用")
     sub.add_parser("doctor", help="体检:配置、密钥、模型、目录、数据库")
     g = sub.add_parser("goal", help="下一个目标")
     g.add_argument("text", nargs="+")
@@ -62,9 +67,14 @@ def main(argv=None) -> int:
     sv.add_argument("--web", action="store_true", help="同时起只读活动视图(只听本机)")
     sv.add_argument("--web-port", type=int, default=8765)
     sub.add_parser("selftest", help="不联网、不调模型,跑一遍自检")
+    return p
 
-    args = p.parse_args(argv)
 
+def main(argv=None) -> int:
+    args = _parser().parse_args(argv)
+
+    if args.cmd is None:
+        return _cmd_repl(args)
     if args.cmd == "init":
         return _cmd_init(args)
     if args.cmd == "selftest":
@@ -85,7 +95,15 @@ def main(argv=None) -> int:
         skills_mod.ensure_dir(cfg)
     conn = db.connect(cfg.db)
     db.init(conn)
+    try:
+        return _dispatch(args, cfg, conn)
+    finally:
+        # 一次性进程不关也无所谓,但交互终端每行都会走一遍这里 ——
+        # 不关就是一个命令漏一个连接,顺带把 dot.db 一直锁着。
+        conn.close()
 
+
+def _dispatch(args, cfg, conn) -> int:
     if args.cmd == "goal":
         text = " ".join(args.text).strip()
         bot = (args.bot or "dot").strip().lower()
@@ -98,7 +116,7 @@ def main(argv=None) -> int:
         print(f"{gid}  {text}")
         if bot != "dot":
             print(f"交给 {bot} 做")
-        print("跑起来:python -m dot serve", file=sys.stderr)
+        print("跑起来:python -m dots serve", file=sys.stderr)
         return 0
 
     if args.cmd == "learn":
@@ -128,16 +146,95 @@ def main(argv=None) -> int:
         )
         return 0
 
-    p.print_help()
+    _parser().print_help()
     return 1
+
+
+# ---------------------------------------------------------------- 交互终端
+
+# 手写的,不引 pyfiglet —— 一个 banner 不值得多一个依赖。
+# 六行等高,test_cli 盯着这点:粘贴时错位一格,这里就报警。
+_BANNER = """
+ ██████╗  ██████╗ ████████╗███████╗
+ ██╔══██╗██╔═══██╗╚══██╔══╝██╔════╝
+ ██║  ██║██║   ██║   ██║   ███████╗
+ ██║  ██║██║   ██║   ██║   ╚════██║
+ ██████╔╝╚██████╔╝   ██║   ███████║
+ ╚═════╝  ╚═════╝    ╚═╝   ╚══════╝"""
+
+
+def banner() -> str:
+    lines = _BANNER.strip("\n").splitlines()
+    assert len({len(x) for x in lines}) == 1, "banner 每行必须等宽,不然右边会歪"
+    return _BANNER.strip("\n")
+
+
+def _cmd_repl(args) -> int:
+    """不带子命令就进这里。
+
+    每一行都原样再走一遍 main(),所以交互里能用的东西和命令行**完全一样**,
+    没有第二套命令表要维护。副作用正合意:每行重读 dot.toml,
+    改完配置不用退出来重进。
+    """
+    # 重定向到文件或管道时不画 —— 那玩意儿是给人看的,不是给日志看的
+    if sys.stdout.isatty():
+        print(banner())
+        print(f"  v{__version__} · 一个会主动发现任务的智能体\n")
+
+    print("命令不带 dots 前缀(如 ls、goal \"...\"),help 看全部,exit 退出。")
+    found = config_mod.resolve(args.config)
+    if found is None:
+        print("(没找到配置。`dots init --global` 配一次,以后在哪都能用)")
+    elif found != Path(config_mod.DEFAULT_FILENAME):
+        print(f"(用的是 {found})")
+
+    while True:
+        try:
+            line = input("dots> ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return 0
+        if not line:
+            continue
+
+        try:
+            argv = shlex.split(line)
+        except ValueError as e:          # 引号没配对
+            print(f"读不懂这行:{e}", file=sys.stderr)
+            continue
+        if not argv:
+            continue
+        if argv[0] in ("exit", "quit", "q"):
+            return 0
+        if argv[0] in ("help", "?"):
+            _parser().print_help()
+            continue
+
+        # 没显式指定就不传 -c —— 让每行自己重新找一遍,
+        # 这样在终端里 init 完,下一条命令就能用上,不用退出来重进。
+        base = ["-c", args.config] if args.config else []
+        try:
+            main([*base, *argv])
+        except KeyboardInterrupt:
+            print("\n(打断,回到终端)")     # 比如 serve 跑着的时候 Ctrl-C
+        except SystemExit as e:           # 配置坏了、argparse 报错
+            if e.code not in (0, None):
+                print(f"(退出码 {e.code})", file=sys.stderr)
 
 
 # ------------------------------------------------------------------ 子命令
 
 def _cmd_init(args) -> int:
-    dest = Path(args.config)
+    # 三种落点:--global 写 ~/.dots,显式 -c 写那儿,都没有就写当前目录
+    if args.global_:
+        dest = config_mod.GLOBAL_PATH
+    elif args.config:
+        dest = Path(args.config)
+    else:
+        dest = Path(config_mod.DEFAULT_FILENAME)
+
     if dest.exists():
-        print(f"{dest} 已经存在,没动它。体检一下:python -m dot doctor")
+        print(f"{dest} 已经存在,没动它。体检一下:dots doctor")
         return 0
 
     text = (Path(__file__).parent / "template.toml").read_text(encoding="utf-8")
@@ -149,6 +246,7 @@ def _cmd_init(args) -> int:
         body.append(f'api_key_env = "{key_env}"' if key_env else '# api_key_env = ""')
         body.append("")
         text = _replace_section_body(text, "model", "\n".join(body))
+    dest.parent.mkdir(parents=True, exist_ok=True)
     dest.write_text(text, encoding="utf-8")
 
     print(f"写好了 {dest}")
@@ -156,11 +254,20 @@ def _cmd_init(args) -> int:
         print(f"探测到环境里有 {preset[2]},[model] 已经按它配好 —— 不用再动。")
     else:
         print("没探测到 API key。先 export 一个再重跑 init,或者手填 [model] 段。")
+
+    if args.global_:
+        print("之后在任何目录敲 dots 都用这一份,数据在 "
+              f"{dest.parent}/(workspace、dot.db)。")
+    else:
+        print(f"这份只在这个目录生效(数据放 {dest.parent})。"
+              f"\n想 cd 到哪都能用:`dots init --global`")
+
     print(
         f"\n下一步:\n"
-        f"  1. python -m dot doctor            体检\n"
-        f"  2. python -m dot goal \"把 inbox 里的东西整理成一份报告\"\n"
-        f"  3. python -m dot serve --web\n"
+        f"  1. dots doctor            体检\n"
+        f"  2. dots goal \"把 inbox 里的东西整理成一份报告\"\n"
+        f"  3. dots serve --web\n"
+        f"\n不带子命令直接敲 dots 会进交互终端,上面这些命令换个方式敲。\n"
     )
     return 0
 
@@ -196,7 +303,7 @@ def _cmd_learn(conn, cfg, source: str) -> int:
     gid = db.add_goal(conn, text, origin="cli:learn", status=db.READY)
     db.audit(conn, gid, "learn", source[:200])
     print(f"{gid}  学:{source[:70]}")
-    print("跑起来:python -m dot serve  (或者 python -m dot tick)", file=sys.stderr)
+    print("跑起来:python -m dots serve  (或者 python -m dots tick)", file=sys.stderr)
     return 0
 
 
@@ -212,7 +319,7 @@ def _cmd_curate(conn, cfg) -> int:
     gid = db.add_goal(conn, text, origin="cli:curate", status=db.READY)
     db.audit(conn, gid, "curate", f"{len(found)} 份技能")
     print(f"{gid}  整理 {len(found)} 份技能")
-    print("提醒:它会真的删/改技能文件。先 python -m dot skills 看一眼现状。",
+    print("提醒:它会真的删/改技能文件。先 python -m dots skills 看一眼现状。",
           file=sys.stderr)
     return 0
 
@@ -221,13 +328,13 @@ def _cmd_skills(cfg) -> int:
     found = skills_mod.scan(cfg)
     if not found:
         print(f"技能库是空的({cfg.workspace / cfg.skills.dir})。")
-        print('攒一份:python -m dot learn "..."')
+        print('攒一份:python -m dots learn "..."')
         return 0
     rows = [(s.name, _w(s.description) and f"{len(s.description):>3}", s.description)
             for s in found]
     print(_table(rows, ("NAME", "LEN", "DESCRIPTION")))
-    print(f"\n{len(found)} 份。看正文:python -m dot skill show <name>"
-          f"   整理:python -m dot curate")
+    print(f"\n{len(found)} 份。看正文:python -m dots skill show <name>"
+          f"   整理:python -m dots curate")
     return 0
 
 
@@ -263,11 +370,12 @@ def _cmd_doctor(args) -> int:
             if fix:
                 print(f"      -> {fix}")
 
-    print(f"dot 体检({args.config})\n")
+    dest = config_mod.resolve(args.config)
+    print(f"dots 体检({dest or args.config or '没找到配置'})\n")
 
-    dest = Path(args.config)
-    if not dest.exists():
-        check("配置文件", False, f"{dest} 不存在", "python -m dot init")
+    if dest is None:
+        check("配置文件", False, "当前目录和 ~/.dots 下都没有",
+              "dots init --global(到处都能用)或 dots init(只在这个目录)")
         return 1
     check("配置文件", True, str(dest.resolve()))
 
@@ -319,7 +427,7 @@ def _cmd_doctor(args) -> int:
     if cfg.smtp.usable:
         check("审批通道", True, f"邮件 -> {cfg.smtp.to}")
     else:
-        print("  ! 审批通道  没配 [smtp] —— 审批只能走 CLI(dot approve),不算错")
+        print("  ! 审批通道  没配 [smtp] —— 审批只能走 CLI(dots approve),不算错")
 
     if cfg.skills.enabled:
         n = len(skills_mod.scan(cfg))
@@ -331,11 +439,11 @@ def _cmd_doctor(args) -> int:
     if cfg.daily_token_budget:
         check("成本上限", True, f"{cfg.daily_token_budget:,} token/天")
     else:
-        print("  ! 成本上限  没设 —— 先跑一天再用 dot cost 看真实数字")
+        print("  ! 成本上限  没设 —— 先跑一天再用 dots cost 看真实数字")
 
     print()
     if ok_all:
-        print("可以跑:python -m dot serve --web")
+        print("可以跑:python -m dots serve --web")
     else:
         print("上面标 ✗ 的先修掉。")
     return 0 if ok_all else 1
@@ -344,7 +452,7 @@ def _cmd_doctor(args) -> int:
 def _cmd_ls(conn, status) -> int:
     goals = db.list_goals(conn, status, limit=100)
     if not goals:
-        print('还没有目标。python -m dot goal "..." 下一个。')
+        print('还没有目标。python -m dots goal "..." 下一个。')
         return 0
 
     # 等审批的目标直接把编号摊在列表里 —— 不然你还得去 log 里翻,
@@ -358,7 +466,7 @@ def _cmd_ls(conn, status) -> int:
     print(_table(rows, ("ID", "STATUS", "TOKEN", "TOKENS", "UPDATED", "TEXT")))
     if waiting:
         tokens = " ".join(sorted(waiting.values()))
-        print(f"\n{len(waiting)} 个在等你。批准:dot approve <编号>   拒绝:dot reject <编号>")
+        print(f"\n{len(waiting)} 个在等你。批准:dots approve <编号>   拒绝:dots reject <编号>")
         print(f"编号:{tokens}")
     return 0
 
@@ -380,7 +488,7 @@ def _cmd_decide(conn, token: str, cmd: str) -> int:
     decision = approvals.APPROVED if cmd == "approve" else approvals.REJECTED
     row = db.get_approval(conn, token)
     if row is None:
-        print(f"没有编号 {token} 的待批动作。python -m dot log 看一眼。", file=sys.stderr)
+        print(f"没有编号 {token} 的待批动作。python -m dots log 看一眼。", file=sys.stderr)
         return 1
     if not db.resolve_approval(conn, token, decision):
         print(f"{token} 已经批过了({row['status']}),这次不算。", file=sys.stderr)
@@ -421,9 +529,9 @@ def _cmd_selftest() -> int:
       完整套件 —— 只在源码仓库里有(wheel 不带 tests/),含假 IMAP 服务器、
                     交接、审批闭环那些。
     硬要两层都跑会逼着把 tests/ 打进 wheel,那不值得:
-    用户要的是「我这套装得对不对」,开发者要的才是那 19 条断言。
+    用户要的是「我这套装得对不对」,开发者要的才是那 20 多条断言。
     """
-    from dot import sources
+    from dots import sources
 
     print("== rules ==")
     rules_mod.demo()
@@ -435,12 +543,12 @@ def _cmd_selftest() -> int:
     skills_mod.demo()
 
     try:
-        from tests import test_loop, test_sources, test_web
+        from tests import test_cli, test_loop, test_sources, test_web
     except ImportError:
         print("\n内置自检通过。")
         print("完整套件(本地假 IMAP 服务器 / 假模型跑 tick / 活动视图)在源码仓库里:")
         print("  git clone https://github.com/duyongan/dots-agent")
-        print("  cd dots-agent && python -m dot selftest")
+        print("  cd dots-agent && python -m dots selftest")
         return 0
 
     print("== 事件源(本地假服务)==")
@@ -449,6 +557,8 @@ def _cmd_selftest() -> int:
     print(test_loop.run())
     print("== 活动视图 ==")
     print(test_web.run())
+    print("== 交互终端 ==")
+    print(test_cli.run())
     print("\n自检通过。")
     return 0
 

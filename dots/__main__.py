@@ -1,4 +1,4 @@
-from dot.cli import main
+from dots.cli import main
 
 if __name__ == "__main__":
     raise SystemExit(main())

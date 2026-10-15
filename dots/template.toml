@@ -1,7 +1,7 @@
-# dot —— 常驻主动式 agent 配置
+# dots —— 常驻主动式 agent 配置
 # 所有相对路径都相对于本文件所在目录。密钥一律走环境变量,不写在这里。
 #
-# 最小可用:填好 [model],然后 python -m dot serve
+# 最小可用:填好 [model],然后 python -m dots serve
 # 邮件事件和邮件审批要额外填 [sources.imap] 和 [smtp]。
 
 [dot]
