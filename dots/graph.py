@@ -27,7 +27,7 @@ from langgraph.types import interrupt
 from dots import approvals, db
 from dots import rules as rules_mod
 from dots import skills as skills_mod
-from dots.prompts import SCOUT_PROMPT, SYSTEM_PROMPT
+from dots.prompts import CHAT_PROMPT, SCOUT_PROMPT, SYSTEM_PROMPT
 
 SHELL_TIMEOUT = 120
 
@@ -47,6 +47,9 @@ class RunCtx:
     conn: object
     goal_id: str | None = None
     bot: str = "dot"
+    # 交互对话里 goal_id 是 None。生命周期工具(complete_goal / handoff_to)
+    # 在无目标时会空转或说谎,靠这个标志改成说实话。
+    chat: bool = False
 
 
 CURRENT: RunCtx | None = None
@@ -92,6 +95,10 @@ def make_tools(ctx: RunCtx, bot_cfg=None):
         邮件 id、URL。没有 evidence 的完成会进待复核队列,而不是 done。
         目标做不到也要调,把原因写在 summary 里。
         """
+        if ctx.chat:
+            # 对话没有 goal 行,这里 set_goal 会空转。宁可说实话,
+            # 也别让模型以为自己"完成任务"了然后不吭声。
+            return "这是对话,不是目标 —— 不需要 complete_goal,直接把结果说出来。"
         has = bool((evidence or "").strip())
         db.set_goal(
             ctx.conn,
@@ -157,6 +164,11 @@ def make_tools(ctx: RunCtx, bot_cfg=None):
         note 是给接手方的简报:说清已经做了什么、材料在哪、下一步干什么。
         交接是有次数上限的,来回甩锅会被拦。
         """
+        if ctx.chat:
+            return (
+                "对话里不能交接 —— 没有目标可交。"
+                "如果这件事该交给别的 bot 慢慢做,让用户用 /goal --bot <名> \"...\"。"
+            )
         goal = db.get_goal(ctx.conn, ctx.goal_id)
         if goal is None:
             return "目标不存在了。"
@@ -254,12 +266,17 @@ def build_model(cfg):
         )
 
 
-def build(cfg, checkpointer, ctx: RunCtx, bot: str = "dot"):
-    """为一个 bot 建一张图。checkpointer 是「崩了续跑」和「交接有上下文」的全部依靠。"""
+def build(cfg, checkpointer, ctx: RunCtx, bot: str = "dot", chat: bool = False):
+    """为一个 bot 建一张图。checkpointer 是「崩了续跑」和「交接有上下文」的全部依靠。
+
+    chat=True 建的是交互对话那张:同一个大脑,提示和工具行为按「没有目标」调整。
+    """
     bot_cfg = cfg.bot(bot)
     prompt = SYSTEM_PROMPT
     if bot_cfg.prompt:
         prompt = f"{SYSTEM_PROMPT}\n---\n\n{bot_cfg.prompt}"
+    if chat:
+        prompt = f"{prompt}\n---\n\n{CHAT_PROMPT}"
 
     kwargs: dict = {}
     if cfg.skills.enabled:

@@ -269,6 +269,95 @@ def _tokens_new(before: list, after: list) -> int:
     return total
 
 
+# ------------------------------------------------------------------- 对话
+
+CHAT_THREAD = "chat"
+
+
+def chat_agents(cfg, conn):
+    """对话用的那张图,返回 (agents, saver)。
+
+    单独 build 一次是为了带上 CHAT_PROMPT。saver 要还给调用方 ——
+    它自己攥着一条 sqlite 连接,不关的话在 Windows 上会一直锁着 db 文件,
+    临时目录删不掉(踩过两次)。
+    """
+    if graph.CURRENT is None:
+        graph.CURRENT = graph.RunCtx(cfg=cfg, conn=conn)
+    if cfg.skills.enabled:
+        skills_mod.ensure_dir(cfg)
+    saver = checkpointer(cfg)
+    return {"dot": graph.build(cfg, saver, graph.CURRENT, bot="dot", chat=True)}, saver
+
+
+def chat_send(agents, cfg, conn, text: str, decide) -> tuple[str, int]:
+    """把一句话发给 agent,拿回 (回答, 花了多少 token)。
+
+    和 _run 的区别是**没有 goal 行**:对话不是目标,不进队列,后台 tick 不碰它。
+    靠固定的 thread_id 记住上下文 —— 换了进程也还在,checkpointer 里存着。
+
+    代价说清楚:所以 complete_goal 在这儿是空转、handoff 会被拦(见 make_tools),
+    `/ls` 里也看不到。要交给后台排队跑,用 `/goal`。
+
+    decide(payload) -> bool 是审批回调:ask 类动作怎么问你,由调用方决定
+    (终端里当场问)。
+    """
+    if graph.CURRENT is None:
+        graph.CURRENT = graph.RunCtx(cfg=cfg, conn=conn)
+    agent = _pick(agents, "dot")
+    config = {"configurable": {"thread_id": CHAT_THREAD}, "recursion_limit": 80}
+    before = _messages(agent.get_state(config))
+
+    graph.CURRENT.goal_id = None
+    graph.CURRENT.bot = "dot"
+    graph.CURRENT.chat = True
+    payload = {"messages": [HumanMessage(text)]}
+    try:
+        for _ in range(20):            # 一个人能连着批 20 次还不收手,那是脚本
+            result = agent.invoke(payload, config)
+            intr = (result or {}).get("__interrupt__")
+            if not intr:
+                break
+            payload = Command(
+                resume={"approved": bool(decide(getattr(intr[0], "value", None) or {}))}
+            )
+    finally:
+        # 用完就复位。tick 复用同一个全局 ctx,带着 chat=True 跑后台目标,
+        # agent 会以为自己在聊天,不调 complete_goal。
+        graph.CURRENT.chat = False
+
+    # 用最后一次 invoke 的返回值,不再 get_state 一趟 —— 同一份数据,少一次往返。
+    after = _messages(result)
+    used = _tokens_new(before, after)
+    db.audit(conn, None, "chat", text[:200], tokens=used)
+    return _last_reply(after), used
+
+
+def _last_reply(messages: list) -> str:
+    """最后一条有内容的 AI 消息。工具调用那种空消息跳过。"""
+    for m in reversed(messages):
+        if getattr(m, "type", "") not in ("ai", "assistant"):
+            continue
+        text = _flatten(getattr(m, "content", ""))
+        if text.strip():
+            return text.strip()
+    return "(它没说话)"
+
+
+def _flatten(content) -> str:
+    """content 可能是字符串,也可能是 [{'type':'text','text':...}, ...]。"""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for block in content:
+            if isinstance(block, str):
+                parts.append(block)
+            elif isinstance(block, dict) and block.get("type") == "text":
+                parts.append(str(block.get("text", "")))
+        return "\n".join(p for p in parts if p)
+    return str(content or "")
+
+
 # --------------------------------------------------------------------- 审批
 
 def _apply_reply(cfg, conn, payload: dict, stats: dict) -> None:

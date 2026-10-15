@@ -7,6 +7,7 @@ CLI 只往 SQLite 写东西,不跟 daemon 通信 —— 没有 socket,没有 IPC
 from __future__ import annotations
 
 import argparse
+import json
 import shlex
 import sys
 import unicodedata
@@ -172,54 +173,135 @@ def banner() -> str:
 def _cmd_repl(args) -> int:
     """不带子命令就进这里。
 
-    每一行都原样再走一遍 main(),所以交互里能用的东西和命令行**完全一样**,
-    没有第二套命令表要维护。副作用正合意:每行重读 dot.toml,
-    改完配置不用退出来重进。
+    两种输入:
+      /ls /goal "..." /approve  → 命令。每一行原样再走一遍 main(),
+                                  所以交互里能用的和命令行**完全一样**,
+                                  没有第二套命令表要维护。
+      其它                      → 当成一句话发给 agent(见 _chat)。
+
+    副作用正合意:每行重读 dot.toml,改完配置不用退出来重进。
     """
     # 重定向到文件或管道时不画 —— 那玩意儿是给人看的,不是给日志看的
     if sys.stdout.isatty():
         print(banner())
         print(f"  v{__version__} · 一个会主动发现任务的智能体\n")
 
-    print("命令不带 dots 前缀(如 ls、goal \"...\"),help 看全部,exit 退出。")
+    print("直接打字 = 和它说话;/ 开头是命令(/help 看全部,/goal 交给后台跑)。")
     found = config_mod.resolve(args.config)
     if found is None:
         print("(没找到配置。`dots init --global` 配一次,以后在哪都能用)")
     elif found != Path(config_mod.DEFAULT_FILENAME):
         print(f"(用的是 {found})")
+    print()
 
-    while True:
+    session = None                   # 第一次说话才建,省掉不聊天时的模型开销
+    try:
+        while True:
+            try:
+                line = input("dots> ").strip()
+            except (EOFError, KeyboardInterrupt):
+                print()
+                return 0
+            if not line:
+                continue
+
+            if not line.startswith("/"):
+                if session is None:
+                    try:
+                        session = _new_chat(args)
+                    except SystemExit as e:
+                        print(e, file=sys.stderr)
+                        continue
+                    if session is None:
+                        continue
+                _ask_agent(session, line)
+                continue
+
+            try:
+                argv = shlex.split(line[1:])
+            except ValueError as e:          # 引号没配对
+                print(f"读不懂这行:{e}", file=sys.stderr)
+                continue
+            if not argv:
+                continue
+            if argv[0] in ("exit", "quit", "q"):
+                return 0
+            if argv[0] in ("help", "?"):
+                _parser().print_help()
+                print("\n交互终端里,上面每个命令前面加 /(如 /ls、/goal \"...\")。")
+                continue
+
+            # 没显式指定就不传 -c —— 让每行自己重新找一遍,
+            # 这样在终端里 init 完,下一条命令就能用上,不用退出来重进。
+            base = ["-c", args.config] if args.config else []
+            try:
+                main([*base, *argv])
+            except KeyboardInterrupt:
+                print("\n(打断,回到终端)")     # 比如 serve 跑着的时候 Ctrl-C
+            except SystemExit as e:           # 配置坏了、argparse 报错
+                if e.code not in (0, None):
+                    print(f"(退出码 {e.code})", file=sys.stderr)
+    finally:
+        if session is not None:
+            _close_chat(session)
+
+
+def _new_chat(args):
+    """建对话用的一张图。建不出来返回 None —— 那样 / 命令还能接着用。"""
+    cfg = config_mod.load(args.config)
+    problems = rules_mod.validate(cfg.rules)
+    if problems:
+        for x in problems:
+            print(f"[dots] 配置有问题:{x}", file=sys.stderr)
+        return None
+    cfg.workspace.mkdir(parents=True, exist_ok=True)
+    conn = db.connect(cfg.db)
+    db.init(conn)
+    try:
+        agents, saver = worker.chat_agents(cfg, conn)
+    except BaseException:
+        conn.close()
+        raise
+    return cfg, agents, conn, saver
+
+
+def _close_chat(session) -> None:
+    """两条连接都要关:应用库一条,checkpointer 自己一条。
+
+    漏掉后者,Windows 上这段时间 dot.db 一直锁着,临时目录删不掉(踩过两次)。
+    """
+    _, _, conn, saver = session
+    conn.close()
+    saver.conn.close()
+
+
+def _ask_agent(session, line: str) -> None:
+    """一句话发给 agent,把回答打出来。
+
+    审批在这里当场问 —— 后台是靠邮件/`/approve`,对话里当场问更顺。
+    """
+    cfg, agents, conn, _ = session
+
+    def decide(payload: dict) -> bool:
+        args = payload.get("args") or {}
+        print(f"\n  它想干这个:{payload.get('action')}"
+              f"  {json.dumps(args, ensure_ascii=False)[:300]}")
         try:
-            line = input("dots> ").strip()
+            return input("  批准?(y/N) ").strip().lower() in ("y", "yes", "是", "同意")
         except (EOFError, KeyboardInterrupt):
             print()
-            return 0
-        if not line:
-            continue
+            return False
 
-        try:
-            argv = shlex.split(line)
-        except ValueError as e:          # 引号没配对
-            print(f"读不懂这行:{e}", file=sys.stderr)
-            continue
-        if not argv:
-            continue
-        if argv[0] in ("exit", "quit", "q"):
-            return 0
-        if argv[0] in ("help", "?"):
-            _parser().print_help()
-            continue
-
-        # 没显式指定就不传 -c —— 让每行自己重新找一遍,
-        # 这样在终端里 init 完,下一条命令就能用上,不用退出来重进。
-        base = ["-c", args.config] if args.config else []
-        try:
-            main([*base, *argv])
-        except KeyboardInterrupt:
-            print("\n(打断,回到终端)")     # 比如 serve 跑着的时候 Ctrl-C
-        except SystemExit as e:           # 配置坏了、argparse 报错
-            if e.code not in (0, None):
-                print(f"(退出码 {e.code})", file=sys.stderr)
+    try:
+        reply, _ = worker.chat_send(agents, cfg, conn, line, decide)
+    except KeyboardInterrupt:
+        # 图停在半路,checkpoint 还在,下一句接着走
+        print("\n(打断。刚才那句的上下文还在。)")
+        return
+    except Exception as e:
+        print(f"{type(e).__name__}: {e}", file=sys.stderr)
+        return
+    print(reply)
 
 
 # ------------------------------------------------------------------ 子命令

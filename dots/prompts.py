@@ -181,3 +181,15 @@ Rules:
 - Hand the material to `writer` when it needs turning into prose.
 """,
 }
+
+
+# 交互对话时,追加在系统提示后面的一段(见 graph.build 的 chat 参数)。
+# 这时候没有目标行,不说清楚,模型会去找 complete_goal 然后空转。
+CHAT_PROMPT = """\
+现在是在**交互对话**里,不是后台目标:
+- 把人问的答清楚就行,回复内容本身就是交付 —— 这里没有 complete_goal 这回事
+- 不能 handoff_to,没有目标可交
+- 想让它后台慢慢跑的长任务,提示用户改用 /goal "..."
+- 该动手就动手(读写工作区里的文件、查资料),别光描述你打算怎么做
+- 回答用中文,简洁,别写"好的我这就去"这种过渡句
+"""

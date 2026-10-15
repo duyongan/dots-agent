@@ -16,6 +16,8 @@ import io
 import tempfile
 from pathlib import Path
 
+from langchain_core.messages import AIMessage
+
 from dots import cli
 from dots import config as config_mod
 
@@ -59,7 +61,7 @@ def _sandbox():
 def test_dispatches_like_the_real_cli() -> str:
     """交互里下的目标,和 `dots goal` 下的是同一条 —— 走的是同一个 main()。"""
     with _sandbox():
-        out, code = _repl(["goal 把 inbox 整理成报告", "ls", "exit"])
+        out, code = _repl(["/goal 把 inbox 整理成报告", "/ls", "/exit"])
     assert code == 0, code
     # 出现两次:goal 的回显一次,ls 从库里读出来一次 —— 证明真落库了,不是回显
     assert out.count("把 inbox 整理成报告") >= 2, out
@@ -70,7 +72,7 @@ def test_dispatches_like_the_real_cli() -> str:
 def test_bad_line_does_not_kill_the_session() -> str:
     """打错命令、引号没配对,都得回到 dots> 接着用。"""
     with _sandbox():
-        out, code = _repl(["goat", 'goal "引号没关', "cost", "exit"])
+        out, code = _repl(["/goat", '/goal "引号没关', "/cost", "/exit"])
     assert code == 0, code
     assert "invalid choice" in out, out
     assert "读不懂这行" in out, out
@@ -82,7 +84,7 @@ def test_missing_config_still_lands_in_the_repl() -> str:
     """没 init 也不能崩 —— 得进终端,并且告诉你去 init。"""
     with tempfile.TemporaryDirectory() as td:
         with contextlib.chdir(td):
-            out, code = _repl(["ls"], args=["-c", "nope.toml"])
+            out, code = _repl(["/ls"], args=["-c", "nope.toml"])
     assert code == 0, code
     assert "没找到配置" in out, out
     return "  没有 dot.toml 时给提示而不是崩  ✓"
@@ -104,11 +106,11 @@ def test_global_config_works_from_anywhere() -> str:
     """init --global 之后,cd 到任何地方都不该再要你 init。"""
     with _fake_home():
         with tempfile.TemporaryDirectory() as work:
-            out, code = _repl(["exit"], args=["init", "--global"])
+            out, code = _repl(["/exit"], args=["init", "--global"])
             assert code == 0 and config_mod.GLOBAL_PATH.exists(), out
 
             with contextlib.chdir(work):
-                out, code = _repl(["goal 出门在外也能下目标", "ls", "exit"])
+                out, code = _repl(["/goal 出门在外也能下目标", "/ls", "/exit"])
                 assert code == 0, code
                 # 出现两次 = 真落库了,不是回显
                 assert out.count("出门在外也能下目标") >= 2, out
@@ -129,7 +131,7 @@ def test_explicit_config_does_not_fall_back() -> str:
                 with contextlib.redirect_stdout(io.StringIO()):
                     cli.main(["init", "--global"])
             with contextlib.chdir(work):
-                out, code = _repl(["ls", "exit"], args=["-c", "tyop.toml"])
+                out, code = _repl(["/ls", "/exit"], args=["-c", "tyop.toml"])
             assert "找不到配置文件" in out, out
     return "  -c 打错字直接报错,不偷偷兜底  ✓"
 
@@ -142,9 +144,52 @@ def test_banner_is_aligned_and_stays_out_of_pipes() -> str:
 
     # 非终端(管道 / 重定向)不该吐方块字,不然日志里全是乱码
     with _sandbox():
-        out, _ = _repl(["exit"])
+        out, _ = _repl(["/exit"])
     assert "█" not in out, "banner 漏进非终端输出了"
     return "  banner 等宽,且只在真终端里出现  ✓"
+
+
+class _FakeAgent:
+    """只验「哪句话走了哪条路」,不碰真模型。
+
+    真跑一轮要花几万 token,而这里要断言的只是路由:裸文本进 agent,斜杠进命令表。
+    """
+
+    def __init__(self, seen: list):
+        self.seen = seen
+
+    def get_state(self, config):
+        return {"messages": []}
+
+    def invoke(self, payload, config):
+        self.seen.append(payload)
+        return {"messages": [AIMessage("收到了")]}
+
+
+class _FakeSaver:
+    class conn:                      # noqa: N801 —— 只为了 .close() 能调
+        @staticmethod
+        def close():
+            pass
+
+
+def test_plain_text_goes_to_the_agent_not_the_parser() -> str:
+    """裸文本是「跟它说话」,不是命令 —— 这是这版交互的全部新意。"""
+    seen: list = []
+    real = cli.worker.chat_agents
+    cli.worker.chat_agents = lambda cfg, conn: ({"dot": _FakeAgent(seen)}, _FakeSaver())
+    try:
+        with _sandbox():
+            out, code = _repl(["把 inbox 整理一下", "/ls", "再来一句"])
+    finally:
+        cli.worker.chat_agents = real
+
+    assert code == 0, code
+    said = [p["messages"][0].content for p in seen if isinstance(p, dict)]
+    assert said == ["把 inbox 整理一下", "再来一句"], said
+    assert out.count("收到了") == 2, out
+    assert "还没有目标" in out, "/ls 没跑起来 —— 斜杠没被当成命令"
+    return "  裸文本给 agent,斜杠还是命令  ✓"
 
 
 def test_eof_exits_clean() -> str:
@@ -162,6 +207,7 @@ def run() -> str:
         test_missing_config_still_lands_in_the_repl,
         test_global_config_works_from_anywhere,
         test_explicit_config_does_not_fall_back,
+        test_plain_text_goes_to_the_agent_not_the_parser,
         test_banner_is_aligned_and_stays_out_of_pipes,
         test_eof_exits_clean,
     ]
