@@ -1,0 +1,51 @@
+[project]
+name = "dots-agent"
+dynamic = ["version"]
+description = "常驻主动式 agent —— 给一个目标,它自己在后台推"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+keywords = ["agent", "llm", "deepagents", "automation", "proactive", "langgraph"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+dependencies = [
+    "deepagents>=0.6",
+    "langgraph-checkpoint-sqlite>=2.0",
+    "python-dateutil>=2.8",
+]
+
+[project.optional-dependencies]
+# 只有跑测试要用:生成自签证书起本地假 IMAP 服务器
+test = ["cryptography>=41", "pytest>=8"]
+
+[project.scripts]
+dot = "dot.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/duyongan/dots-agent"
+Source = "https://github.com/duyongan/dots-agent"
+Issues = "https://github.com/duyongan/dots-agent/issues"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["dot"]
+
+[tool.setuptools.dynamic]
+version = { attr = "dot.__version__" }
+
+[tool.setuptools.package-data]
+# dot init 要读这个模板。少了它,wheel 装完就 init 不了。
+dot = ["template.toml"]

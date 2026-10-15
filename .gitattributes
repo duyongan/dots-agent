@@ -1,0 +1,13 @@
+# 仓库里一律存 LF。不加这个,Windows 上每次提交都会把整个文件标成改动。
+* text=auto eol=lf
+
+# Windows 批处理必须留 CRLF,否则跑不起来
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# 二进制,别让 git 试图做行尾转换
+*.png binary
+*.jpg binary
+*.ico binary
+*.whl binary
+*.db binary

@@ -1,0 +1,30 @@
+# ---- 你的数据,绝不能进仓库 ----
+# dot.toml 是 `dot init` 生成的本机配置(路径、邮箱、白名单),性质同 .env。
+# 仓库里传的是 dot/template.toml,别人靠它生成自己的 dot.toml。
+dot.toml
+# 目标、审计、审批记录全在这个 sqlite 里
+dot.db
+dot.db-wal
+dot.db-shm
+# agent 的工作区:你扔进去的文件、它写出来的产出、它自己攒的技能
+workspace/
+# 别的地方指过来的自定义配置
+*.local.toml
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# ---- 编辑器 / 系统 ----
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
