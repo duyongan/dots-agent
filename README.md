@@ -29,24 +29,42 @@ python -m dots serve
 
 ### 桌面版(Windows)
 
-安装包在仓库的 `release/` 下:
+#### 怎么打开
+
+日常使用**双击 `dots.exe`**(或者桌面/开始菜单里的 `dots` 快捷方式)。装好之后它在:
+
+```text
+%LOCALAPPDATA%\Programs\dots\dots.exe
+```
+
+`dots-0.1.0-setup.exe` 只是**安装器**,装一次就行,不是日常打开方式。
+
+#### 安装
+
+安装包由打包命令生成到 `release/`(该目录不进仓库):
 
 ```text
 release/dots-0.1.0-setup.exe
 ```
 
-双击安装。安装器是**按用户安装**,不需要管理员权限,默认装在:
-
-```text
-%LOCALAPPDATA%\Programs\dots
-```
-
-安装过程中可以改目录;会创建桌面快捷方式和开始菜单项。卸载走 Windows 的
-「设置 → 应用 → 已安装的应用 → dots」。
+双击安装。安装器是**按用户安装**,不需要管理员权限,默认装到
+`%LOCALAPPDATA%\Programs\dots`。安装过程中可以改目录;会创建桌面快捷方式和开始菜单项。
+卸载走 Windows 的「设置 → 应用 → 已安装的应用 → dots」。
 
 安装包自带一份嵌入式 Python 和全部依赖(`resources/runtime/`),**机器上没装过 Python 也能跑**。
 
-在仓库里开发桌面版:
+不想安装也可以直接运行 `release/win-unpacked/dots.exe`。它旁边必须保留 `resources/`
+目录(运行时都在里面),不能只把这个 exe 单独拷走。
+
+自己打包:
+
+```bash
+cd desktop
+bash make-runtime.sh      # 首次,或 dots/ 源码改动后
+npm run dist              # 生成 release/dots-0.1.0-setup.exe
+```
+
+#### 在仓库里开发
 
 ```bash
 cd desktop
