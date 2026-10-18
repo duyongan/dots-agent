@@ -175,14 +175,20 @@ class _FakeSaver:
 
 def test_plain_text_goes_to_the_agent_not_the_parser() -> str:
     """裸文本是「跟它说话」,不是命令 —— 这是这版交互的全部新意。"""
+    # 补丁打在 dots.worker 模块本身上,不打在 cli 上:`cli` 现在是惰性导入
+    # worker(顶层导会把 langchain 连累进来),模块上根本没有 worker 这个属性。
+    # 打在模块对象上,`_new_chat` 里那句 `from dots import worker` 拿到的
+    # 就是同一个对象,照样打中。
+    from dots import worker as worker_mod
+
     seen: list = []
-    real = cli.worker.chat_agents
-    cli.worker.chat_agents = lambda cfg, conn: ({"dot": _FakeAgent(seen)}, _FakeSaver())
+    real = worker_mod.chat_agents
+    worker_mod.chat_agents = lambda cfg, conn: ({"dot": _FakeAgent(seen)}, _FakeSaver())
     try:
         with _sandbox():
             out, code = _repl(["把 inbox 整理一下", "/ls", "再来一句"])
     finally:
-        cli.worker.chat_agents = real
+        worker_mod.chat_agents = real
 
     assert code == 0, code
     said = [p["messages"][0].content for p in seen if isinstance(p, dict)]

@@ -1,0 +1,109 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <!-- 不加载任何远程内容:字体随包带,不走 CDN -->
+  <meta http-equiv="Content-Security-Policy"
+        content="default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:">
+  <title>dots</title>
+  <link rel="stylesheet" href="theme.css">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body data-ready="0">
+
+  <!-- 顶栏:后端状态 + 循环启停 -->
+  <header id="topbar">
+    <b class="brand">dots</b>
+    <span id="backend-state" class="pill">正在启动后端…</span>
+    <span id="loop-slot"></span>
+    <span class="spacer"></span>
+    <button id="btn-doctor" class="btn ghost"
+            title="逐项检查配置、密钥、模型、目录、数据库、事件源（dots doctor）">体检</button>
+  </header>
+
+  <!-- 待批横幅:只在有东西等你时出现。一屏里唯一的强调色 -->
+  <section id="alert-bar" hidden></section>
+
+  <!-- 监控区 -->
+  <main id="monitor">
+    <section class="pane" id="pane-goals">
+      <div class="pane-head">
+        <h2>目标</h2>
+        <span class="pane-actions" id="goal-actions"></span>
+      </div>
+      <div class="pane-body" id="goals"></div>
+    </section>
+
+    <section class="pane" id="pane-skills">
+      <div class="pane-head">
+        <h2>技能</h2>
+        <span class="pane-actions" id="skill-actions"></span>
+      </div>
+      <div class="pane-body" id="skills"></div>
+    </section>
+
+    <section class="pane" id="pane-activity">
+      <div class="pane-head">
+        <h2>活动</h2>
+        <span class="pane-actions" id="activity-actions"></span>
+      </div>
+      <div class="pane-body" id="activity"></div>
+    </section>
+  </main>
+
+  <!-- 对话:常驻在监控区下面 -->
+  <section id="chat">
+    <div class="pane-head">
+      <h2>对话</h2>
+      <span id="chat-status" class="hint"></span>
+    </div>
+    <div id="chat-log" class="pane-body"></div>
+    <form id="chat-form">
+      <input id="chat-input" autocomplete="off" spellcheck="false"
+             placeholder="说点什么…（回车发送）">
+    </form>
+  </section>
+
+  <!-- 命令抽屉:默认收起,点把手展开;窗口太矮自动收起 -->
+  <footer id="drawer" class="collapsed">
+    <button id="drawer-handle" class="handle" aria-expanded="false">▴ 全部命令</button>
+    <div id="drawer-body" class="drawer-body"></div>
+  </footer>
+
+  <!-- 命令输出:从底部升起的一层 -->
+  <section id="output" hidden>
+    <div class="pane-head">
+      <h2 id="output-title">输出</h2>
+      <span id="output-code" class="hint"></span>
+      <span class="spacer"></span>
+      <button id="output-copy" class="btn ghost">复制</button>
+      <button id="output-close" class="btn ghost">关闭</button>
+    </div>
+    <pre id="output-body"></pre>
+  </section>
+
+  <!-- 带参数的命令(新建目标 / 学习 / 看技能…)要一个输入框。
+       不能用 window.prompt —— Electron 不支持它,会静默返回 null。 -->
+  <dialog id="input-modal">
+    <h3 id="input-title">输入</h3>
+    <input id="input-field" autocomplete="off" spellcheck="false">
+    <div class="modal-actions">
+      <button id="input-cancel" class="btn">取消</button>
+      <button id="input-ok" class="btn primary">确定</button>
+    </div>
+  </dialog>
+
+  <!-- 聊天里的审批确认 -->
+  <dialog id="ask-modal">
+    <h3>它想干这个</h3>
+    <p id="ask-action" class="ask-action"></p>
+    <pre id="ask-args"></pre>
+    <div class="modal-actions">
+      <button id="ask-no" class="btn">拒绝</button>
+      <button id="ask-yes" class="btn primary">批准</button>
+    </div>
+  </dialog>
+
+  <script src="app.js"></script>
+</body>
+</html>

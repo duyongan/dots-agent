@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import os
 import subprocess
+import threading
 from dataclasses import dataclass
 
 from deepagents import create_deep_agent
@@ -40,8 +41,8 @@ CORE_TOOLS = {"complete_goal", "create_goal", "handoff_to", "save_skill"}
 class RunCtx:
     """当前这一轮在跑哪个 goal、哪个 bot。
 
-    单机单 worker,一次只跑一个 goal,所以一个模块级实例够用。
-    ponytail: 全局单值;哪天要并发跑多个 goal,改成从 config 里取。
+    一个线程一份,不是全局一份。桌面界面的 bridge 里 tick 和聊天各占一条线程,
+    各有各的 goal_id / bot / chat,共用一个实例会被两边互相踩。
     """
     cfg: object
     conn: object
@@ -52,14 +53,62 @@ class RunCtx:
     chat: bool = False
 
 
-CURRENT: RunCtx | None = None
+# 线程局部,不是模块全局。桌面界面的 bridge 里 tick 和聊天跑在两条线程上,
+# 各有各的 RunCtx(goal_id / bot / chat 都不同),模块全局会被两边互相踩。
+#
+# 别用模块级 __getattr__ 来糊:读会走 __getattr__,但 `graph.CURRENT = x`
+# 是直接设模块属性 —— 设完之后读就再也走不到 __getattr__ 了,
+# 线程局部语义会静默失效。所以老老实实给两个访问函数。
+_local = threading.local()
+
+
+def current() -> RunCtx | None:
+    """当前线程的 RunCtx。这个线程没设过就返回 None。"""
+    return getattr(_local, "ctx", None)
+
+
+def set_current(ctx: RunCtx | None) -> None:
+    """给当前线程装上 RunCtx;传 None 就是拆掉。"""
+    _local.ctx = ctx
+
+
+def use_or_create(cfg, conn) -> RunCtx:
+    """本线程没有就建一个,有就把连接重新绑上。
+
+    worker 里原来那几处 `if CURRENT is None: CURRENT = RunCtx(...)` 全走它。
+
+    不变量:**每个真会 invoke 图的入口,都得在 invoke 之前,用自己那条活连接
+    调一次它**(tick / chat_agents / chat_send / build_agents 现在都这么做了)。
+    工具闭包捏的是建图那一刻的 ctx,入口自己不重绑,后来换上的连接就传不进去
+    —— 以后新加入口(桌面界面的又一条线程、后台某个定时任务)时别漏这一步。
+    """
+    ctx = current()
+    if ctx is None:
+        ctx = RunCtx(cfg=cfg, conn=conn)
+        set_current(ctx)
+    else:
+        # 只「有就用现成的」不够。同一条长驻线程上会换连接:命令线程跑
+        # `dots tick`,cli.main 每次自己开一条连接、跑完就关;第二次点「跑一轮」
+        # 时 ctx 还攥着上一条已经关掉的连接,工具一写库就
+        # `Cannot operate on a closed database` —— 而且会被 langgraph 吞成
+        # 工具错误喂回模型,表现成「目标莫名其妙永远完不成」,极难查。
+        #
+        # 改的是对象内部的字段,不是换新对象 —— 工具的闭包捏着这个 ctx。
+        ctx.cfg, ctx.conn = cfg, conn
+    return ctx
 
 
 # --------------------------------------------------------------------- 闸门
 
-def _gate(action: str, args: dict) -> str | None:
-    """放行返回 None;拦住返回一句给模型看的话。"""
-    ctx = CURRENT
+def _gate(ctx: RunCtx, action: str, args: dict) -> str | None:
+    """放行返回 None;拦住返回一句给模型看的话。
+
+    ctx 从工具闭包传进来,不读线程局部 —— 工具闭包捏的是 build 时的 ctx,
+    这里再读一次线程局部就有了两个真相来源。今天每条线程都是「先 set_current
+    再 build」所以两者一致;哪天变成 A 线程建图、B 线程 invoke,
+    `rules_mod.decide(action, ctx.cfg.rules)` 就会用另一条线程的配置做审批判定
+    (可能放行本该 ASK/DENY 的动作),audit 也会记到错的 goal_id 上。
+    """
     verdict = rules_mod.decide(action, ctx.cfg.rules)
     db.audit(ctx.conn, ctx.goal_id, "gate", f"{action} -> {verdict}")
 
@@ -147,7 +196,7 @@ def make_tools(ctx: RunCtx, bot_cfg=None):
         problem = skills_mod.validate(name, description)
         if problem:
             return f"没存成。{problem}"
-        blocked = _gate("save_skill", {"name": name})
+        blocked = _gate(ctx, "save_skill", {"name": name})
         if blocked:
             return blocked
         path = skills_mod.save(ctx.cfg, name, description, body)
@@ -199,7 +248,7 @@ def make_tools(ctx: RunCtx, bot_cfg=None):
     def send_email(to: str, subject: str, body: str) -> str:
         """给某人发邮件。可能被规则拒绝,也可能挂起等人工批准。被拒了不要重试。"""
         args = {"to": to, "subject": subject, "body": body}
-        blocked = _gate("send_email", args)
+        blocked = _gate(ctx, "send_email", args)
         if blocked:
             return blocked
         try:
@@ -217,7 +266,7 @@ def make_tools(ctx: RunCtx, bot_cfg=None):
         ponytail: shell=True + 只靠 cwd 兜着,这不是沙箱。要真隔离就换容器 backend。
         """
         args = {"cmd": cmd}
-        blocked = _gate("run_shell", args)
+        blocked = _gate(ctx, "run_shell", args)
         if blocked:
             return blocked
         try:

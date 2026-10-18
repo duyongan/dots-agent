@@ -102,7 +102,7 @@ def _setup(root: Path):
     (cfg.workspace / "inbox").mkdir(parents=True, exist_ok=True)
     conn = db.connect(cfg.db)
     db.init(conn)
-    graph.CURRENT = graph.RunCtx(cfg=cfg, conn=conn)
+    graph.set_current(graph.RunCtx(cfg=cfg, conn=conn))
     return cfg, conn
 
 
@@ -292,9 +292,9 @@ def _case_approval_expiry(cfg, conn) -> str:
 
 def _case_save_skill_validated(cfg, conn) -> str:
     """不合规的描述必须被拒 —— 描述每轮都进系统提示并被截断,超了等于没写。"""
-    graph.CURRENT.goal_id = "x"
-    graph.CURRENT.bot = "dot"
-    tools = {t.name: t for t in graph.make_tools(graph.CURRENT, cfg.bot("dot"))}
+    graph.current().goal_id = "x"
+    graph.current().bot = "dot"
+    tools = {t.name: t for t in graph.make_tools(graph.current(), cfg.bot("dot"))}
     save = tools["save_skill"]
 
     bad_name = save.invoke({"name": "Summarize Inbox!", "description": "Does it.", "body": "b"})
@@ -335,7 +335,7 @@ def _case_save_skill_validated(cfg, conn) -> str:
 
 def _case_handoff(cfg, conn) -> str:
     """交接:换 bot、记简报、有次数上限。"""
-    tools = {t.name: t for t in graph.make_tools(graph.CURRENT, cfg.bot("dot"))}
+    tools = {t.name: t for t in graph.make_tools(graph.current(), cfg.bot("dot"))}
     handoff = tools["handoff_to"]
 
     # 先测跑起来之后的行为:交接完就算 agent 顺手 complete_goal 也不算数
@@ -344,7 +344,7 @@ def _case_handoff(cfg, conn) -> str:
 
     class HandoffThenComplete(StubAgent):
         def invoke(self, payload, config):
-            graph.CURRENT.goal_id = gid
+            graph.current().goal_id = gid
             seen["msg"] = handoff.invoke(
                 {"bot": "writer", "reason": "这是写作任务", "note": "材料在 out.md"}
             )
@@ -366,8 +366,8 @@ def _case_handoff(cfg, conn) -> str:
     # 工具层的边界
     db.set_goal(conn, gid, status=db.REVIEW)   # 挪开,别干扰后面的 pick_ready
     gid2 = db.add_goal(conn, "边界", origin="cli", status=db.READY)
-    graph.CURRENT.goal_id = gid2
-    graph.CURRENT.bot = "dot"
+    graph.current().goal_id = gid2
+    graph.current().bot = "dot"
 
     assert "不能交给自己" in handoff.invoke({"bot": "dot", "reason": "r", "note": "n"})
     assert "没有叫" in handoff.invoke({"bot": "nope", "reason": "r", "note": "n"})

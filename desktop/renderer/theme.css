@@ -1,0 +1,57 @@
+/* theme.css —— 主题就是这一组变量。
+ *
+ * 组件只引用变量,不写死颜色。以后「导入主题」= 读一份 CSS 覆盖 :root,
+ * 加个按钮的事,不用回头改任何组件。本期不做导入 UI。
+ *
+ * 方向:值班台。
+ *   底色是深石板蓝,不是近黑 —— 近黑 + 单一荧光色是「AI 生成页面」的典型长相。
+ *   七个状态各占一个色相,靠颜色认状态而不是靠亮度。
+ *   琥珀只留给「它停下来等你」,一屏里唯一的响。
+ */
+
+:root {
+  /* 底与面:靠明度差分层,不靠描边 */
+  --bg: #161a20;
+  --panel: #1d222a;
+  --panel-2: #222a34;
+  --panel-3: #1a1f27;
+  --line: #262d38;
+  --line-soft: #2a323d;
+
+  /* 文字三级 */
+  --fg: #e4e7eb;
+  --fg-dim: #a8b2c0;
+  --fg-muted: #7c879a;
+
+  /* 它停下来等你 —— 整个界面唯一的强调色 */
+  --wait: #e0a458;
+  --wait-bg: #241f17;
+  --wait-line: #4a3a1a;
+
+  /* 七个状态一个都不能少(running 恰恰是最常看到的那个) */
+  --st-pending: #8a7ba8;
+  --st-ready: #5fa8d3;
+  --st-running: #5fa8d3;
+  --st-interrupted: #e0a458;
+  --st-review: #a08bb8;
+  --st-done: #7fa663;
+  --st-failed: #c4634f;
+
+  /* 中文优先:中文走系统黑体栈,西文和数字配等宽补个性 */
+  --font: "Microsoft YaHei UI", "Microsoft YaHei", "PingFang SC",
+    "Noto Sans CJK SC", system-ui, sans-serif;
+  /* 等宽只用在数字、编号、时间上 —— 不是整页等宽 */
+  --font-num: "Cascadia Mono", Consolas, "SF Mono", ui-monospace, monospace;
+
+  --r: 4px;
+  --gap: 10px;
+  --pad: 12px;
+}
+
+/* 尊重系统的「减少动态效果」 */
+@media (prefers-reduced-motion: reduce) {
+  * {
+    animation-duration: 0.01ms !important;
+    transition-duration: 0.01ms !important;
+  }
+}

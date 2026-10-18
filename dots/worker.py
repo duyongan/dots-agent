@@ -44,8 +44,7 @@ def tick(cfg, conn, agents, *, dry_run: bool = False) -> dict:
         "handoffs": 0, "skipped": 0, "paused": None,
     }
     # tick 可以脱离 serve 单独跑(测试和 `dots tick` 都走这条路)
-    if graph.CURRENT is None:
-        graph.CURRENT = graph.RunCtx(cfg=cfg, conn=conn)
+    graph.use_or_create(cfg, conn)
 
     # 1. 收事件
     for e in sources.poll_all(cfg, conn):
@@ -143,8 +142,9 @@ def _run(cfg, conn, agents, goal, *, dry_run: bool, stats: dict, resume=None,
 
     bot = goal["bot"]
     agent = _pick(agents, bot)
-    graph.CURRENT.goal_id = gid
-    graph.CURRENT.bot = bot
+    ctx = graph.current()
+    ctx.goal_id = gid
+    ctx.bot = bot
     config = {"configurable": {"thread_id": gid}, "recursion_limit": 80}
 
     before = _messages(agent.get_state(config))
@@ -281,12 +281,11 @@ def chat_agents(cfg, conn):
     它自己攥着一条 sqlite 连接,不关的话在 Windows 上会一直锁着 db 文件,
     临时目录删不掉(踩过两次)。
     """
-    if graph.CURRENT is None:
-        graph.CURRENT = graph.RunCtx(cfg=cfg, conn=conn)
+    ctx = graph.use_or_create(cfg, conn)
     if cfg.skills.enabled:
         skills_mod.ensure_dir(cfg)
     saver = checkpointer(cfg)
-    return {"dot": graph.build(cfg, saver, graph.CURRENT, bot="dot", chat=True)}, saver
+    return {"dot": graph.build(cfg, saver, ctx, bot="dot", chat=True)}, saver
 
 
 def chat_send(agents, cfg, conn, text: str, decide) -> tuple[str, int]:
@@ -301,15 +300,14 @@ def chat_send(agents, cfg, conn, text: str, decide) -> tuple[str, int]:
     decide(payload) -> bool 是审批回调:ask 类动作怎么问你,由调用方决定
     (终端里当场问)。
     """
-    if graph.CURRENT is None:
-        graph.CURRENT = graph.RunCtx(cfg=cfg, conn=conn)
+    ctx = graph.use_or_create(cfg, conn)
     agent = _pick(agents, "dot")
     config = {"configurable": {"thread_id": CHAT_THREAD}, "recursion_limit": 80}
     before = _messages(agent.get_state(config))
 
-    graph.CURRENT.goal_id = None
-    graph.CURRENT.bot = "dot"
-    graph.CURRENT.chat = True
+    ctx.goal_id = None
+    ctx.bot = "dot"
+    ctx.chat = True
     payload = {"messages": [HumanMessage(text)]}
     try:
         for _ in range(20):            # 一个人能连着批 20 次还不收手,那是脚本
@@ -321,9 +319,9 @@ def chat_send(agents, cfg, conn, text: str, decide) -> tuple[str, int]:
                 resume={"approved": bool(decide(getattr(intr[0], "value", None) or {}))}
             )
     finally:
-        # 用完就复位。tick 复用同一个全局 ctx,带着 chat=True 跑后台目标,
+        # 用完就复位。同一个线程里 tick 复用同一份 ctx,带着 chat=True 跑后台目标,
         # agent 会以为自己在聊天,不调 complete_goal。
-        graph.CURRENT.chat = False
+        ctx.chat = False
 
     # 用最后一次 invoke 的返回值,不再 get_state 一趟 —— 同一份数据,少一次往返。
     after = _messages(result)
@@ -385,7 +383,7 @@ def _paused(cfg, conn, stats: dict) -> bool:
     """budget=0 = 不限制。填了数就在这里拦 —— 不动 agent 一行代码。"""
     if not cfg.daily_token_budget:
         return False
-    used = db.tokens_since(conn, _local_midnight())
+    used = db.tokens_since(conn, db.local_midnight())
     if used < cfg.daily_token_budget:
         return False
     stats["paused"] = f"今日已用 {used}/{cfg.daily_token_budget} token,暂停跑新目标"
@@ -394,11 +392,6 @@ def _paused(cfg, conn, stats: dict) -> bool:
         db.meta_set(conn, key, "1")
         db.audit(conn, None, "budget_paused", stats["paused"])
     return True
-
-
-def _local_midnight() -> float:
-    n = datetime.now()
-    return n.replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
 
 
 # --------------------------------------------------------------------- 主循环
@@ -423,18 +416,20 @@ def checkpointer(cfg):
     return saver
 
 
-def build_agents(cfg, conn) -> dict:
+def build_agents(cfg, conn) -> tuple[dict, object]:
     """每个配置过的 bot 一张图,共用同一个 checkpointer。
 
     共用 checkpointer 是交接有上下文的关键:thread_id 是目标 id,
     换了 bot 也还是同一条线程,新 bot 能看见前任的全部消息。
+
+    返回 (agents, saver):saver 自己攥着一条 sqlite 连接,关它是调用方的事
+    —— bridge 的 tick 线程退出时要关;serve 是长驻进程,随进程一起收走。
     """
-    if graph.CURRENT is None:
-        graph.CURRENT = graph.RunCtx(cfg=cfg, conn=conn)
+    ctx = graph.use_or_create(cfg, conn)
     if cfg.skills.enabled:
         skills_mod.ensure_dir(cfg)
     saver = checkpointer(cfg)
-    return {name: graph.build(cfg, saver, graph.CURRENT, bot=name) for name in cfg.bots}
+    return {name: graph.build(cfg, saver, ctx, bot=name) for name in cfg.bots}, saver
 
 
 def summarize(stats: dict) -> str:
@@ -477,7 +472,7 @@ def serve(cfg, conn, *, dry_run: bool = False, once: bool = False,
             from dots import web as web_mod
 
             web_mod.start(cfg.db, port=web_port)
-    agents = build_agents(cfg, conn)
+    agents, _saver = build_agents(cfg, conn)   # serve 是长驻进程,退出时进程一起收走
     if once:
         stats = tick(cfg, conn, agents, dry_run=dry_run)
         print(summarize(stats) or "无事发生")
