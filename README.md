@@ -6,6 +6,17 @@
 
 ## 安装
 
+### Windows 一键安装
+
+不用装 Python，直接下载安装包：
+
+https://github.com/duyongan/dots-agent/releases/latest/download/dots-setup-1.0.0.exe
+
+双击安装，装到当前用户目录（不需要管理员权限），自动加进 PATH。
+**装完新开一个终端**，敲 `dots` 就能用。卸载在开始菜单里。
+
+### pip
+
 ```bash
 pip install dots-agent
 ```
