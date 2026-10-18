@@ -31,9 +31,9 @@ desktop/dist/
 desktop/runtime/
 # 安装包输出。几百 MB,绝不进仓库
 release/
-# 设计阶段的线框图/草图/计划/规格(agent 协作产物),留在本地就行
+# 设计阶段的线框图/草图/计划/规格/截图(agent 协作产物),留在本地就行
 .superpowers/
-docs/superpowers/
+docs/
 
 # 临时日志
 *.log
