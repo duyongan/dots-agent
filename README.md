@@ -8,9 +8,9 @@
 
 ### Windows 一键安装
 
-不用装 Python，直接下载安装包：
+不用装 Python，在最新版本的 Assets 里下载 `dots-setup-<版本>.exe`：
 
-https://github.com/duyongan/dots-agent/releases/latest/download/dots-setup-1.0.0.exe
+https://github.com/duyongan/dots-agent/releases/latest
 
 双击安装，装到当前用户目录（不需要管理员权限），自动加进 PATH。
 装完从开始菜单打开 **dots（网页界面）** 就能用，不用碰命令行；也可以
