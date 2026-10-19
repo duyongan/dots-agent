@@ -13,6 +13,7 @@ import json
 import secrets
 import sqlite3
 import time
+from datetime import datetime
 
 SCHEMA_VERSION = 2
 
@@ -359,6 +360,17 @@ def recent_audit(conn, limit: int = 50, goal_id: str | None = None):
     return conn.execute(
         "SELECT * FROM audit ORDER BY id DESC LIMIT ?", (limit,)
     ).fetchall()
+
+
+def local_midnight() -> float:
+    """今天零点的时间戳。
+
+    放这儿而不是 worker 里:`dots cost` 要用它,而 worker 会连累
+    cli 把 langchain 整个导进来(8.7 秒)。这是个纯日期函数,跟 SQL 层放一起
+    比跟编排层放一起更合适。
+    """
+    n = datetime.now()
+    return n.replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
 
 
 def tokens_since(conn, ts: float) -> int:

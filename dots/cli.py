@@ -17,11 +17,14 @@ from pathlib import Path
 from dots import __version__
 from dots import approvals, db
 from dots import config as config_mod
-from dots import graph as graph_mod
 from dots import rules as rules_mod
 from dots import skills as skills_mod
-from dots import worker
 from dots.prompts import CURATE_PROMPT, LEARN_PROMPT
+
+
+# 别在模块顶层导入 dots.worker / dots.graph —— 那条链
+# (worker -> graph -> deepagents -> langchain -> transformers -> torch)在开发机上
+# 8.7 秒,而 `dots ls` 只是读几行 SQLite。用到的地方就地导入,每处都标了为什么。
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -67,15 +70,32 @@ def _parser() -> argparse.ArgumentParser:
     sv.add_argument("--once", action="store_true", help="只跑一轮就退")
     sv.add_argument("--web", action="store_true", help="同时起只读活动视图(只听本机)")
     sv.add_argument("--web-port", type=int, default=8765)
-    gu = sub.add_parser("gui", help="打开本地图形界面(聊天/配置/技能/审批)")
+    gu = sub.add_parser("gui", help="打开本地网页界面(聊天/配置/技能/审批)")
     gu.add_argument("--port", type=int, default=8765)
     gu.add_argument("--no-browser", action="store_true", help="只起服务,不开浏览器")
     gu.add_argument("--dry-run", action="store_true", help="不真发邮件")
     sub.add_parser("selftest", help="不联网、不调模型,跑一遍自检")
+    br = sub.add_parser("bridge", help="给桌面界面用的 JSON-lines 后端(一般不用手敲)")
+    # bridge 有自己的解析器(main() 里那份)。这里只是让 `dots bridge --no-loop`
+    # 不被顶层当成错参数。default=SUPPRESS 是关键:subparser 的默认值会**覆盖**
+    # 顶层命名空间,不压住的话 `dots -c x bridge` 里前面那个 -c 会被抹成 None。
+    br.add_argument("-c", "--config", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
+    br.add_argument("--no-loop", action="store_true", default=argparse.SUPPRESS,
+                    help="起来了先不跑 tick 循环")
     return p
 
 
 def main(argv=None) -> int:
+    # Windows 控制台/管道默认是 GBK,而自检和 doctor 要打 ✓ 和中文。
+    # 不换编码就是 UnicodeEncodeError: 'gbk' codec can't encode '✓' ——
+    # 用户拿到的是栈,不是体检结果。换不了就算了(比如 stdout 被换成了
+    # 我们自己那种只有 write 的桩)。
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8")
+        except (AttributeError, ValueError):
+            pass
+
     args = _parser().parse_args(argv)
 
     if args.cmd is None:
@@ -86,8 +106,14 @@ def main(argv=None) -> int:
         return _cmd_selftest()
     if args.cmd == "doctor":
         return _cmd_doctor(args)
+    if args.cmd == "bridge":
+        from dots import bridge as bridge_mod   # 惰性:只有界面用得上
+        argv = ["-c", args.config] if getattr(args, "config", None) else []
+        if getattr(args, "no_loop", False):
+            argv.append("--no-loop")
+        return bridge_mod.main(argv)
     if args.cmd == "gui":
-        from dots import gui as gui_mod
+        from dots import gui as gui_mod      # 惰性:只有网页界面用得上
         return gui_mod.run_gui(
             config=args.config, port=args.port,
             open_browser=not args.no_browser, dry_run=args.dry_run,
@@ -148,9 +174,11 @@ def _dispatch(args, cfg, conn) -> int:
     if args.cmd == "cost":
         return _cmd_cost(conn, cfg)
     if args.cmd == "tick":
+        from dots import worker      # 惰性:要跑 agent,本来就慢
         worker.serve(cfg, conn, dry_run=args.dry_run, once=True)
         return 0
     if args.cmd == "serve":
+        from dots import worker      # 惰性:要跑常驻循环,本来就慢
         worker.serve(
             cfg, conn, dry_run=args.dry_run, once=args.once,
             web=args.web, web_port=args.web_port,
@@ -236,6 +264,11 @@ def _cmd_repl(args) -> int:
                 continue
             if argv[0] in ("exit", "quit", "q"):
                 return 0
+            if argv[0] == "bridge":
+                # bridge 要独占 stdin,在这儿跑会把 input() 饿死 ——
+                # 之后每行都被它当成「不是合法 JSON」,直到 EOF 才回到 dots>。
+                print("bridge 是给桌面界面用的,不能在交互终端里跑。", file=sys.stderr)
+                continue
             if argv[0] in ("help", "?"):
                 _parser().print_help()
                 print("\n交互终端里,上面每个命令前面加 /(如 /ls、/goal \"...\")。")
@@ -258,6 +291,8 @@ def _cmd_repl(args) -> int:
 
 def _new_chat(args):
     """建对话用的一张图。建不出来返回 None —— 那样 / 命令还能接着用。"""
+    from dots import worker          # 惰性:只有真聊天才需要 langchain
+
     cfg = config_mod.load(args.config)
     problems = rules_mod.validate(cfg.rules)
     if problems:
@@ -268,7 +303,7 @@ def _new_chat(args):
     conn = db.connect(cfg.db)
     db.init(conn)
     try:
-        agents, saver, _ctx = worker.chat_agents(cfg, conn)
+        agents, saver = worker.chat_agents(cfg, conn)
     except BaseException:
         conn.close()
         raise
@@ -290,6 +325,8 @@ def _ask_agent(session, line: str) -> None:
 
     审批在这里当场问 —— 后台是靠邮件/`/approve`,对话里当场问更顺。
     """
+    from dots import worker          # 惰性:只有真发消息才需要 langchain
+
     cfg, agents, conn, _ = session
 
     def decide(payload: dict) -> bool:
@@ -329,8 +366,15 @@ def _cmd_init(args) -> int:
         print(f"{dest} 已经存在,没动它。体检一下:dots doctor")
         return 0
 
+    text = (Path(__file__).parent / "template.toml").read_text(encoding="utf-8")
     preset = config_mod.detect_model()
-    text = config_mod.create_template_text(preset)
+    if preset:
+        name, base_url, key_env, _ = preset
+        body = [f'name = "{name}"']
+        body.append(f'base_url = "{base_url}"' if base_url else '# base_url = ""')
+        body.append(f'api_key_env = "{key_env}"' if key_env else '# api_key_env = ""')
+        body.append("")
+        text = _replace_section_body(text, "model", "\n".join(body))
     dest.parent.mkdir(parents=True, exist_ok=True)
     dest.write_text(text, encoding="utf-8")
 
@@ -355,6 +399,27 @@ def _cmd_init(args) -> int:
         f"\n不带子命令直接敲 dots 会进交互终端,上面这些命令换个方式敲。\n"
     )
     return 0
+
+
+def _replace_section_body(text: str, section: str, body: str) -> str:
+    """把 [section] 下面的内容整段换掉,直到下一个 [ 开头的行。
+
+    比按行字符串替换稳:模板里的注释行随便改,这里都不会错位。
+    """
+    lines = text.splitlines()
+    out: list[str] = []
+    i, n = 0, len(lines)
+    while i < n:
+        if lines[i].strip() == f"[{section}]":
+            out.append(lines[i])
+            out.append(body)
+            i += 1
+            while i < n and not lines[i].lstrip().startswith("["):
+                i += 1
+            continue
+        out.append(lines[i])
+        i += 1
+    return "\n".join(out) + "\n"
 
 
 # --------------------------------------------------------------- 技能
@@ -456,11 +521,19 @@ def _cmd_doctor(args) -> int:
           "改 [approval.rules] 的值,只能是 allow / ask / deny")
 
     try:
-        graph_mod.build_model(cfg)
-        check("模型", True, cfg.model.name)
-    except SystemExit as e:
-        check("模型", False, str(e).splitlines()[0],
-              "填 [model];第三方端点要 name / base_url / api_key_env 三件套")
+        from dots import graph as graph_mod   # 惰性:doctor 要真建一个模型,这条路径本来就慢
+    except ImportError as e:
+        # 依赖装坏时 doctor 正是用户会来敲的那条命令,它必须能说出「✗ 依赖 …」
+        # 而不是甩一屏栈。ImportError 和 SystemExit 没有继承关系,混在一起就漏了。
+        check("依赖", False, f"{type(e).__name__}: {e}",
+              "依赖没装全:pip install -e .(或 pip install --upgrade dots-agent)")
+    else:
+        try:
+            graph_mod.build_model(cfg)
+            check("模型", True, cfg.model.name)
+        except SystemExit as e:
+            check("模型", False, str(e).splitlines()[0],
+                  "填 [model];第三方端点要 name / base_url / api_key_env 三件套")
 
     try:
         cfg.workspace.mkdir(parents=True, exist_ok=True)
@@ -565,7 +638,7 @@ def _cmd_decide(conn, token: str, cmd: str) -> int:
 
 
 def _cmd_cost(conn, cfg) -> int:
-    day = db.tokens_since(conn, worker._local_midnight())
+    day = db.tokens_since(conn, db.local_midnight())
     total = db.tokens_since(conn, 0)
     print(f"今日  {_n(day)}")
     print(f"累计  {_n(total)}")
@@ -607,7 +680,7 @@ def _cmd_selftest() -> int:
     skills_mod.demo()
 
     try:
-        from tests import test_cli, test_loop, test_sources, test_web
+        from tests import test_bridge, test_cli, test_loop, test_sources, test_web
     except ImportError:
         print("\n内置自检通过。")
         print("完整套件(本地假 IMAP 服务器 / 假模型跑 tick / 活动视图)在源码仓库里:")
@@ -619,6 +692,8 @@ def _cmd_selftest() -> int:
     print(test_sources.run())
     print("== 一轮 tick(用假模型)==")
     print(test_loop.run())
+    print("== 桌面后端(bridge)==")
+    print(test_bridge.run())
     print("== 活动视图 ==")
     print(test_web.run())
     print("== 交互终端 ==")

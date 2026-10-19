@@ -139,11 +139,7 @@ def test_static_index_injects_token() -> None:
         svc.shutdown()
 
 
-def test_config_save(monkeypatch) -> None:
-    def fake_build(cfg, conn):
-        return {"dot": object()}, _FakeSaver(), graph.RunCtx(cfg=cfg, conn=conn)
-
-    monkeypatch.setattr(worker, "build_agents_fresh", fake_build)
+def test_config_save() -> None:
     svc = _make_service()
     srv, base = _start(svc)
     try:
@@ -179,7 +175,7 @@ def test_chat_interrupt_and_resume() -> None:
     svc = _make_service()
     agent = _FakeAgent()
     svc.chat = _FakeSession(svc.cfg, agent)
-    prev_ctx = graph.CURRENT
+    prev_ctx = graph.current()
     srv, base = _start(svc)
     try:
         status, res = _req(base, "/api/chat", "POST", {"text": "帮我发邮件"},
@@ -199,7 +195,7 @@ def test_chat_interrupt_and_resume() -> None:
         assert res["reply"] == "批准后完成"
         assert isinstance(agent.invokes[-1], Command)
 
-        assert graph.CURRENT is prev_ctx             # 用完复位
+        assert graph.current() is prev_ctx           # 用完复位
         assert svc.chat.ctx.chat is False
     finally:
         srv.shutdown()

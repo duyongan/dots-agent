@@ -3,8 +3,9 @@
 和 web.py 的只读活动页不是一回事:这里能聊天、改配置、管技能、批动作,
 所以写请求要带启动时生成的 token。页面由同源服务,恶意站点读不到它。
 
-后台 tick 和聊天共用 worker.RUN_LOCK,谁也不能同时动 graph.CURRENT
-和 checkpoint 连接。HTTP 线程、tick 线程都只是这把锁的调用方。
+tick 和聊天各用各的线程、各用各的 RunCtx(线程局部)和 checkpointer 连接,
+所以可以并发。建图必须在真正 invoke 它的那条线程里做 —— 工具闭包捏的
+就是建图时的 ctx。
 """
 
 from __future__ import annotations
@@ -17,6 +18,7 @@ import re
 import secrets
 import sys
 import threading
+import time
 import traceback
 import webbrowser
 from datetime import datetime
@@ -95,10 +97,16 @@ class ChatSession:
         self.conn = db.connect(cfg.db)
         db.init(self.conn)
         try:
-            self.agents, self.saver, self.ctx = worker.chat_agents(cfg, self.conn)
+            self.agents, self.saver = worker.chat_agents(cfg, self.conn)
         except BaseException:
             self.conn.close()
             raise
+        # chat_agents 在本线程 use_or_create 过;工具闭包捏的就是这个 ctx。
+        self.ctx = graph.current()
+        if self.ctx is None:
+            self.conn.close()
+            self.saver.conn.close()
+            raise RuntimeError("chat_agents 没建立 RunCtx")
         self.pending = self._initial_pending()
 
     def _initial_pending(self):
@@ -130,14 +138,16 @@ class Service:
         self.stop_event = threading.Event()
         self.wake = threading.Event()
         self.state_lock = threading.RLock()
-        self.chat_lock = threading.Lock()
+        # 可重入:chat_history 会在 chat_send 持锁时被同一线程再进一次。
+        self.chat_lock = threading.RLock()
 
         self.cfg = None
-        self.conn = None
+        self.tick_conn = None
         self.agents = None
         self.saver = None
-        self.ctx = None
+        self.tick_ctx = None
         self.chat = None
+        self.chat_dirty = False
         self.config_error = None
         self.needs_reload = False
         self._recovered = False
@@ -153,68 +163,87 @@ class Service:
         if created:
             print(f"[dots] 首次启动,已生成配置 {self.config_path}")
         config_mod.load_secrets(secrets_path(self.config_path))
-        with worker.RUN_LOCK:
-            with self.state_lock:
-                self._build_locked()
+        self._load_cfg()
         self.tick_thread = threading.Thread(
             target=self._tick_loop, name="dots-gui-tick", daemon=True
         )
         self.tick_thread.start()
+
+    def _load_cfg(self) -> None:
+        """只读配置,给 HTTP 端和界面看;建图归 tick 线程。"""
+        try:
+            cfg = config_mod.load(self.config_path)
+        except SystemExit as e:
+            self.config_error = str(e)
+            with self.state_lock:
+                self.cfg = None
+            return
+        with self.state_lock:
+            self.cfg = cfg
+        try:
+            cfg.workspace.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            self.config_error = f"工作区建不出来:{e}"
 
     def shutdown(self) -> None:
         self.stop_event.set()
         self.wake.set()
         if self.tick_thread is not None:
             self.tick_thread.join(timeout=8)
-        if worker.RUN_LOCK.acquire(timeout=3):
+        if self.chat_lock.acquire(timeout=3):
             try:
-                with self.state_lock:
-                    self._close_runtime_locked()
+                self._close_chat_locked()
             finally:
-                worker.RUN_LOCK.release()
+                self.chat_lock.release()
 
-    def _build_locked(self) -> None:
-        """重新读配置、建库、建图。调用方必须拿着 RUN_LOCK。"""
-        self._close_runtime_locked()
+    def _rebuild_tick(self) -> None:
+        """在 tick 线程里重建运行态。
+
+        graph 的 RunCtx 是线程局部的,建图和 invoke 必须在同一条线程 ——
+        所以这个方法只能被 tick 线程调用。
+        """
+        self._close_tick_runtime()
         self.config_error = None
         try:
             cfg = config_mod.load(self.config_path)
         except SystemExit as e:
             self.config_error = str(e)
+            with self.state_lock:
+                self.cfg = None
             return
-        self.cfg = cfg
+        with self.state_lock:
+            self.cfg = cfg
         try:
             cfg.workspace.mkdir(parents=True, exist_ok=True)
             conn = db.connect(cfg.db)
             db.init(conn)
-            self.conn = conn
+            self.tick_conn = conn
             if not self._recovered:
                 worker.recover_stale_runs(cfg, conn)
                 self._recovered = True
-            self.agents, self.saver, self.ctx = worker.build_agents_fresh(cfg, conn)
+            self.agents, self.saver = worker.build_agents(cfg, conn)
+            self.tick_ctx = graph.current()
         except SystemExit as e:
             self.config_error = str(e)
         except Exception as e:
             self.config_error = f"{type(e).__name__}: {e}"
 
-    def _close_runtime_locked(self) -> None:
-        self._close_chat_locked()
+    def _close_tick_runtime(self) -> None:
         if self.saver is not None:
             try:
                 self.saver.conn.close()
             except Exception:
                 pass
-        if self.conn is not None:
+        if self.tick_conn is not None:
             try:
-                self.conn.close()
+                self.tick_conn.close()
             except Exception:
                 pass
-        self.cfg = None
-        self.conn = None
         self.agents = None
         self.saver = None
-        self.ctx = None
-        self.needs_reload = False
+        self.tick_conn = None
+        self.tick_ctx = None
+        graph.set_current(None)
 
     def _close_chat_locked(self) -> None:
         if self.chat is not None:
@@ -224,61 +253,65 @@ class Service:
                 pass
             self.chat = None
 
-    def _reload_locked(self) -> None:
-        with self.state_lock:
-            self._build_locked()
-
-    def reload(self) -> bool:
-        """配置变了:能马上重建就重建,正在跑就等下轮。"""
-        if not worker.RUN_LOCK.acquire(timeout=1.5):
-            self.needs_reload = True
-            self.wake.set()
-            return False
-        try:
-            self._reload_locked()
-        finally:
-            worker.RUN_LOCK.release()
+    def reload(self, timeout: float = 1.5) -> bool:
+        """叫醒 tick 线程重建;它正跑着就等一会儿。"""
+        self.needs_reload = True
         self.wake.set()
-        return True
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if not self.needs_reload and self.agents is not None:
+                return True
+            time.sleep(0.05)
+        return False
 
     def _tick_loop(self) -> None:
-        while not self.stop_event.is_set():
-            try:
-                with worker.RUN_LOCK:
-                    if self.needs_reload:
-                        self._reload_locked()
+        try:
+            while not self.stop_event.is_set():
+                try:
+                    if self.needs_reload or self.agents is None:
+                        self._rebuild_tick()
+                        self.needs_reload = False
                     if self.agents is not None:
-                        with worker.use_ctx(self.ctx):
-                            stats = worker.tick(
-                                self.cfg, self.conn, self.agents, dry_run=self.dry_run
-                            )
+                        stats = worker.tick(
+                            self.cfg, self.tick_conn, self.agents, dry_run=self.dry_run
+                        )
                         line = worker.summarize(stats)
                         if line:
                             print(f"[dots] {line}")
-            except Exception:
-                text = traceback.format_exc()[-1200:]
-                print(text, file=sys.stderr)
-                if self.conn is not None:
-                    try:
-                        db.audit(self.conn, None, "tick_error", text)
-                    except Exception:
-                        pass
-            wait = self.cfg.tick_seconds if self.cfg is not None else 5
-            self.wake.wait(max(1, wait))
-            self.wake.clear()
+                except Exception:
+                    text = traceback.format_exc()[-1200:]
+                    print(text, file=sys.stderr)
+                    if self.tick_conn is not None:
+                        try:
+                            db.audit(self.tick_conn, None, "tick_error", text)
+                        except Exception:
+                            pass
+                wait = self.cfg.tick_seconds if self.cfg is not None else 5
+                self.wake.wait(max(1, wait))
+                self.wake.clear()
+        finally:
+            self._close_tick_runtime()
 
     # -- 聊天 ---------------------------------------------------------
 
     def _ensure_chat_locked(self) -> ChatSession:
-        if self.chat is not None:
+        if self.chat is not None and not self.chat_dirty:
             return self.chat
-        if not self.agents:
-            raise ApiError(409, "model_not_ready",
-                           self.config_error or "模型还没配好,先去配置页填 API Key。")
+        if self.chat is not None:
+            self._close_chat_locked()
+        self.chat_dirty = False
         try:
-            self.chat = ChatSession(self.cfg)
+            cfg = config_mod.load(self.config_path)
         except SystemExit as e:
             raise ApiError(409, "model_not_ready", str(e))
+        with self.state_lock:
+            self.cfg = cfg
+        try:
+            self.chat = ChatSession(cfg)
+        except SystemExit as e:
+            raise ApiError(409, "model_not_ready", str(e))
+        except Exception as e:
+            raise ApiError(409, "model_not_ready", f"{type(e).__name__}: {e}")
         self.chat.pending = self._pending_from_state(self.chat) or self.chat.pending
         return self.chat
 
@@ -293,35 +326,33 @@ class Service:
         return None
 
     def chat_history(self) -> dict:
-        if self.chat is None:
-            return {"messages": [], "interrupt": None, "busy": False}
-        if not worker.RUN_LOCK.acquire(timeout=0.3):
-            return {"messages": [], "interrupt": self.chat.pending, "busy": True}
+        if not self.chat_lock.acquire(blocking=False):
+            pending = self.chat.pending if self.chat is not None else None
+            return {"messages": [], "interrupt": pending, "busy": True}
         try:
-            with self.state_lock:
-                session = self.chat
-                if session is None:
-                    return {"messages": [], "interrupt": None, "busy": False}
-                state = session.agents["dot"].get_state(worker.chat_config())
-                messages = worker._messages(state)
-                out = []
-                for m in messages:
-                    kind = getattr(m, "type", "")
-                    if kind in ("human", "user"):
-                        role = "user"
-                    elif kind in ("ai", "assistant"):
-                        role = "assistant"
-                    else:
-                        continue
-                    text = worker._flatten(getattr(m, "content", "")).strip()
-                    if text:
-                        out.append({"role": role, "content": text})
-                pending = self._pending_from_state(session)
-                if pending:
-                    session.pending = pending
-                return {"messages": out, "interrupt": session.pending, "busy": False}
+            session = self.chat
+            if session is None:
+                return {"messages": [], "interrupt": None, "busy": False}
+            state = session.agents["dot"].get_state(worker.chat_config())
+            messages = worker._messages(state)
+            out = []
+            for m in messages:
+                kind = getattr(m, "type", "")
+                if kind in ("human", "user"):
+                    role = "user"
+                elif kind in ("ai", "assistant"):
+                    role = "assistant"
+                else:
+                    continue
+                text = worker._flatten(getattr(m, "content", "")).strip()
+                if text:
+                    out.append({"role": role, "content": text})
+            pending = self._pending_from_state(session)
+            if pending:
+                session.pending = pending
+            return {"messages": out, "interrupt": session.pending, "busy": False}
         finally:
-            worker.RUN_LOCK.release()
+            self.chat_lock.release()
 
     def _chat_result(self, session, result, interrupt, used: int) -> dict:
         history = self.chat_history()
@@ -340,27 +371,19 @@ class Service:
         if not self.chat_lock.acquire(blocking=False):
             raise ApiError(409, "busy", "上一轮还在跑,等它结束。")
         try:
-            if not worker.RUN_LOCK.acquire(blocking=False):
-                raise ApiError(409, "busy", "后台任务正在运行,等这一轮结束再发。")
-            try:
-                if self.needs_reload:
-                    self._reload_locked()
-                session = self._ensure_chat_locked()
-                if session.pending:
-                    raise ApiError(409, "pending", "有个动作还等你批准,先处理它。")
-                agent = session.agents["dot"]
-                before = worker._messages(agent.get_state(worker.chat_config()))
-                with worker.use_ctx(session.ctx):
-                    result, interrupt = worker.chat_turn(
-                        agent, session.ctx, {"messages": [HumanMessage(text)]}
-                    )
-                after = worker._messages(result)
-                used = worker._tokens_new(before, after)
-                db.audit(session.conn, None, "chat", text[:200], tokens=used)
-                session.pending = interrupt
-                return self._chat_result(session, result, interrupt, used)
-            finally:
-                worker.RUN_LOCK.release()
+            session = self._ensure_chat_locked()
+            if session.pending:
+                raise ApiError(409, "pending", "有个动作还等你批准,先处理它。")
+            agent = session.agents["dot"]
+            before = worker._messages(agent.get_state(worker.chat_config()))
+            result, interrupt = worker.chat_turn(
+                agent, session.ctx, {"messages": [HumanMessage(text)]}
+            )
+            after = worker._messages(result)
+            used = worker._tokens_new(before, after)
+            db.audit(session.conn, None, "chat", text[:200], tokens=used)
+            session.pending = interrupt
+            return self._chat_result(session, result, interrupt, used)
         finally:
             self.chat_lock.release()
 
@@ -368,32 +391,25 @@ class Service:
         if not self.chat_lock.acquire(blocking=False):
             raise ApiError(409, "busy", "上一轮还在跑。")
         try:
-            if not worker.RUN_LOCK.acquire(blocking=False):
-                raise ApiError(409, "busy", "后台任务正在运行。")
-            try:
-                with self.state_lock:
-                    session = self.chat
-                if session is None:
-                    raise ApiError(409, "conflict", "没有挂起的对话动作。")
-                pending = session.pending or self._pending_from_state(session)
-                if not pending:
-                    raise ApiError(409, "conflict", "没有挂起的对话动作。")
-                agent = session.agents["dot"]
-                before = worker._messages(agent.get_state(worker.chat_config()))
-                with worker.use_ctx(session.ctx):
-                    result, interrupt = worker.chat_turn(
-                        agent, session.ctx,
-                        Command(resume={"approved": bool(approved)}),
-                    )
-                after = worker._messages(result)
-                used = worker._tokens_new(before, after)
-                db.audit(session.conn, None, "chat_decision",
-                         f"{pending.get('action')} -> {'approved' if approved else 'rejected'}",
-                         tokens=used)
-                session.pending = interrupt
-                return self._chat_result(session, result, interrupt, used)
-            finally:
-                worker.RUN_LOCK.release()
+            session = self.chat
+            if session is None:
+                raise ApiError(409, "conflict", "没有挂起的对话动作。")
+            pending = session.pending or self._pending_from_state(session)
+            if not pending:
+                raise ApiError(409, "conflict", "没有挂起的对话动作。")
+            agent = session.agents["dot"]
+            before = worker._messages(agent.get_state(worker.chat_config()))
+            result, interrupt = worker.chat_turn(
+                agent, session.ctx,
+                Command(resume={"approved": bool(approved)}),
+            )
+            after = worker._messages(result)
+            used = worker._tokens_new(before, after)
+            db.audit(session.conn, None, "chat_decision",
+                     f"{pending.get('action')} -> {'approved' if approved else 'rejected'}",
+                     tokens=used)
+            session.pending = interrupt
+            return self._chat_result(session, result, interrupt, used)
         finally:
             self.chat_lock.release()
 
@@ -513,8 +529,9 @@ class Service:
                     os.environ.pop(key, None)
                 else:
                     os.environ[key] = str(value)
+        self.chat_dirty = True
         restarted = self.reload()
-        # reload 没拿到锁时运行态还是旧的,但文件已经是新的;
+        # reload 没赶上时运行态还是旧的,但文件已经是新的;
         # 回给界面的 DTO 一定要从文件重读,否则刚填的值会被旧值盖掉。
         fresh = None
         try:
@@ -540,6 +557,7 @@ class Service:
                 os.environ.pop(key, None)
             else:
                 os.environ[key] = str(value)
+        self.chat_dirty = True
         self.reload()
         return {"ok": True, "set": {k: bool(os.environ.get(k)) for k in merged},
                 "secrets": self.secrets_dto()}
@@ -584,8 +602,7 @@ class Service:
         if not create and name not in existing:
             raise ApiError(404, "not_found", "没有这个技能。")
         path = skills_mod.save(cfg, name, description.strip(), body)
-        if self.conn is not None:
-            db.audit(self.conn, None, "save_skill_ui", f"{name}: {description[:80]}")
+        self._audit("save_skill_ui", f"{name}: {description[:80]}")
         return {"ok": True, "name": name, "path": str(path)}
 
     def skill_delete(self, name: str) -> dict:
@@ -594,9 +611,18 @@ class Service:
             raise ApiError(500, "config", "配置读不出来。")
         if not skills_mod.remove(self.cfg, name):
             raise ApiError(404, "not_found", "没有这个技能。")
-        if self.conn is not None:
-            db.audit(self.conn, None, "remove_skill_ui", name)
+        self._audit("remove_skill_ui", name)
         return {"ok": True}
+
+    def _audit(self, kind: str, detail: str) -> None:
+        """HTTP 线程写审计用自己的一条短连接,别借 tick 线程那条。"""
+        if self.cfg is None:
+            return
+        conn = db.connect(self.cfg.db)
+        try:
+            db.audit(conn, None, kind, detail)
+        finally:
+            conn.close()
 
 
 def _check_skill_name(name: str) -> None:

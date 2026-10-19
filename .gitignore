@@ -26,6 +26,21 @@ frontend/node_modules/
 .coverage
 htmlcov/
 
+# ---- 桌面界面(Electron) ----
+desktop/node_modules/
+desktop/dist/
+# 打包时随安装包带走的 Python 运行时(嵌入式 Python + 依赖 + dots 包)。
+# 一百多 MB 的二进制,绝不进仓库;要重生成就用 README 里那两条命令。
+desktop/runtime/
+# 安装包输出。几百 MB,绝不进仓库
+release/
+# 设计阶段的线框图/草图/计划/规格/截图(agent 协作产物),留在本地就行
+.superpowers/
+docs/
+
+# 临时日志
+*.log
+
 # ---- 编辑器 / 系统 ----
 .vscode/
 .idea/
