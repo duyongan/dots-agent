@@ -3,7 +3,7 @@
 ; 产物：release\dots-setup-<版本>.exe
 
 #define MyAppName "dots"
-#define MyAppVersion "1.1.0"
+#define MyAppVersion "1.1.1"
 #define MyAppPublisher "duyongan"
 #define MyAppURL "https://github.com/duyongan/dots-agent"
 #define MyAppExeName "dots.exe"
