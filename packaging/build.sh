@@ -7,6 +7,13 @@ cd "$(dirname "$0")/.."
 PY=".venv-build/Scripts/python.exe"
 [ -x "$PY" ] || { python -m venv .venv-build; "$PY" -m pip install -q -U pip pyinstaller; "$PY" -m pip install -q .; }
 
+# 前端产物提交在 dots/webui，但发版前重构建一遍，保证和源码一致。
+if [ ! -d frontend/node_modules ]; then
+  (cd frontend && npm ci)
+fi
+(cd frontend && npm run build)
+test -f dots/webui/index.html
+
 "$PY" -m PyInstaller --clean --noconfirm packaging/dots.spec
 ./.venv-build/Scripts/dots.exe selftest
 

@@ -14,6 +14,8 @@ root = os.path.abspath(os.path.join(SPECPATH, ".."))
 # dots init 要读模板，frozen 后 __file__ 指向 _internal/dots/cli.py，
 # 所以模板必须放在 dots/ 下面。
 datas = [(os.path.join(root, "dots", "template.toml"), "dots")]
+# React 构建产物（提交在 dots/webui），gui.py 按 __file__ 找它。
+datas.append((os.path.join(root, "dots", "webui"), "dots/webui"))
 # deepagents 的提示词/资源不是 .py，静态分析看不见。
 datas += collect_data_files("deepagents")
 
@@ -52,8 +54,22 @@ exe = EXE(
     upx=False,
     console=True,
 )
+# 同一个 Analysis/PYZ,只多一个无控制台的启动器:开始菜单双击不弹黑框。
+gui_exe = EXE(
+    pyz,
+    a.scripts,
+    [],
+    exclude_binaries=True,
+    name="dots-gui",
+    debug=False,
+    bootloader_ignore_signals=False,
+    strip=False,
+    upx=False,
+    console=False,
+)
 coll = COLLECT(
     exe,
+    gui_exe,
     a.binaries,
     a.datas,
     strip=False,

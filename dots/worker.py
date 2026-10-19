@@ -15,8 +15,10 @@ from __future__ import annotations
 import json
 import sqlite3
 import sys
+import threading
 import time
 import traceback
+from contextlib import contextmanager
 from datetime import datetime
 
 from langchain_core.messages import HumanMessage
@@ -273,20 +275,67 @@ def _tokens_new(before: list, after: list) -> int:
 
 CHAT_THREAD = "chat"
 
+# tick 和聊天共用的闸门。两者都会动 graph.CURRENT 和 checkpointer,
+# 单进程里必须串行 —— tick 是后台线程,聊天是 HTTP 线程。
+RUN_LOCK = threading.RLock()
+
+
+@contextmanager
+def use_ctx(ctx):
+    """临时把全局 RunCtx 换成这次的。
+
+    graph 的工具闭包各个不一样,但 _gate() 读的是 graph.CURRENT;
+    不换的话,后台 tick 的规则和连接会被聊天借走。
+    """
+    prev = graph.CURRENT
+    graph.CURRENT = ctx
+    try:
+        yield ctx
+    finally:
+        graph.CURRENT = prev
+
 
 def chat_agents(cfg, conn):
-    """对话用的那张图,返回 (agents, saver)。
+    """对话用的那张图,返回 (agents, saver, ctx)。
 
     单独 build 一次是为了带上 CHAT_PROMPT。saver 要还给调用方 ——
     它自己攥着一条 sqlite 连接,不关的话在 Windows 上会一直锁着 db 文件,
     临时目录删不掉(踩过两次)。
+
+    ctx 也单独建:GUI 里后台 tick 和聊天各用各的连接和规则,
+    不能借用 graph.CURRENT 里那个。
     """
-    if graph.CURRENT is None:
-        graph.CURRENT = graph.RunCtx(cfg=cfg, conn=conn)
     if cfg.skills.enabled:
         skills_mod.ensure_dir(cfg)
+    ctx = graph.RunCtx(cfg=cfg, conn=conn)
     saver = checkpointer(cfg)
-    return {"dot": graph.build(cfg, saver, graph.CURRENT, bot="dot", chat=True)}, saver
+    return {"dot": graph.build(cfg, saver, ctx, bot="dot", chat=True)}, saver, ctx
+
+
+def chat_config() -> dict:
+    return {"configurable": {"thread_id": CHAT_THREAD}, "recursion_limit": 80}
+
+
+def chat_turn(agent, ctx, payload) -> tuple[dict, dict | None]:
+    """对对话图做一次 invoke。返回 (state, 中断载荷或 None)。
+
+    payload 可以是 {"messages": [HumanMessage(...)]},也可以是
+    Command(resume=...)。调用方负责拿 RUN_LOCK 和 use_ctx ——
+    GUI 一次 HTTP 请求只走到「中断」或「回答」为止,审批在下一个请求里续。
+    """
+    ctx.goal_id = None
+    ctx.bot = "dot"
+    ctx.chat = True
+    try:
+        result = agent.invoke(payload, chat_config()) or {}
+    finally:
+        # 用完就复位。tick 复用同一个上下文字段,带着 chat=True 跑后台目标,
+        # agent 会以为自己在聊天,不调 complete_goal。
+        ctx.chat = False
+    intr = result.get("__interrupt__")
+    if not intr:
+        return result, None
+    return result, (getattr(intr[0], "value", None) or {})
 
 
 def chat_send(agents, cfg, conn, text: str, decide) -> tuple[str, int]:
@@ -303,27 +352,17 @@ def chat_send(agents, cfg, conn, text: str, decide) -> tuple[str, int]:
     """
     if graph.CURRENT is None:
         graph.CURRENT = graph.RunCtx(cfg=cfg, conn=conn)
+    ctx = graph.CURRENT
     agent = _pick(agents, "dot")
-    config = {"configurable": {"thread_id": CHAT_THREAD}, "recursion_limit": 80}
-    before = _messages(agent.get_state(config))
+    before = _messages(agent.get_state(chat_config()))
 
-    graph.CURRENT.goal_id = None
-    graph.CURRENT.bot = "dot"
-    graph.CURRENT.chat = True
     payload = {"messages": [HumanMessage(text)]}
-    try:
+    with use_ctx(ctx):
         for _ in range(20):            # 一个人能连着批 20 次还不收手,那是脚本
-            result = agent.invoke(payload, config)
-            intr = (result or {}).get("__interrupt__")
-            if not intr:
+            result, intr = chat_turn(agent, ctx, payload)
+            if intr is None:
                 break
-            payload = Command(
-                resume={"approved": bool(decide(getattr(intr[0], "value", None) or {}))}
-            )
-    finally:
-        # 用完就复位。tick 复用同一个全局 ctx,带着 chat=True 跑后台目标,
-        # agent 会以为自己在聊天,不调 complete_goal。
-        graph.CURRENT.chat = False
+            payload = Command(resume={"approved": bool(decide(intr))})
 
     # 用最后一次 invoke 的返回值,不再 get_state 一趟 —— 同一份数据,少一次往返。
     after = _messages(result)
@@ -423,6 +462,14 @@ def checkpointer(cfg):
     return saver
 
 
+def _build_agents(cfg, conn, ctx):
+    if cfg.skills.enabled:
+        skills_mod.ensure_dir(cfg)
+    saver = checkpointer(cfg)
+    agents = {name: graph.build(cfg, saver, ctx, bot=name) for name in cfg.bots}
+    return agents, saver
+
+
 def build_agents(cfg, conn) -> dict:
     """每个配置过的 bot 一张图,共用同一个 checkpointer。
 
@@ -431,10 +478,19 @@ def build_agents(cfg, conn) -> dict:
     """
     if graph.CURRENT is None:
         graph.CURRENT = graph.RunCtx(cfg=cfg, conn=conn)
-    if cfg.skills.enabled:
-        skills_mod.ensure_dir(cfg)
-    saver = checkpointer(cfg)
-    return {name: graph.build(cfg, saver, graph.CURRENT, bot=name) for name in cfg.bots}
+    agents, _saver = _build_agents(cfg, conn, graph.CURRENT)
+    return agents
+
+
+def build_agents_fresh(cfg, conn):
+    """GUI 用:显式建一份新的 RunCtx 并把 saver 交出来。
+
+    saver 攥着自己的 sqlite 连接,配置热重载时要能关掉它,
+    否则 Windows 上 db 文件一直被锁着。
+    """
+    ctx = graph.RunCtx(cfg=cfg, conn=conn)
+    agents, saver = _build_agents(cfg, conn, ctx)
+    return agents, saver, ctx
 
 
 def summarize(stats: dict) -> str:

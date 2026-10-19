@@ -13,7 +13,11 @@
 https://github.com/duyongan/dots-agent/releases/latest/download/dots-setup-1.0.0.exe
 
 双击安装，装到当前用户目录（不需要管理员权限），自动加进 PATH。
-**装完新开一个终端**，敲 `dots` 就能用。卸载在开始菜单里。
+装完从开始菜单打开 **dots（网页界面）** 就能用，不用碰命令行；也可以
+**新开一个终端**敲 `dots`。卸载在开始菜单里。
+
+配置、数据库、工作区和密钥都在安装目录里（`%LOCALAPPDATA%\Programs\dots`），
+升级和卸载都不会动它们。
 
 ### pip
 
@@ -38,11 +42,20 @@ python -m dots serve
 
 ## 快速开始
 
+最省事的是图形界面：
+
+```bash
+dots gui                   # 起本地界面并打开浏览器
+```
+
+聊天、审批、目标、配置、技能都在这里。第一次打开会引导你选服务商、填 API Key。
+不想装浏览器界面也行，命令行照样能用：
+
 ```bash
 dots init --global         # 配一次,以后 cd 到哪都能敲 dots
 dots doctor                # 体检一下
 dots goal "把 inbox 里的东西整理成一份报告"
-dots serve --web           # 常驻跑起来,同时开活动视图
+dots serve --web           # 常驻跑起来,同时开只读活动视图
 ```
 
 `--global` 把配置写到 `~/.dots/`,数据和 `workspace/` 也跟着放那儿 ——
@@ -83,10 +96,26 @@ dots> /exit
 dots selftest              # 不联网、不调模型
 ```
 
+## 图形界面
+
+`dots gui` 在本机 `127.0.0.1` 起一个网页,只监听本机;写操作要带启动时
+生成的 token,浏览器里正常点按钮就行。四个页面:
+
+- **聊天**:和它说话。它要发邮件、跑命令这类 `ask` 动作时,当场批准/拒绝。
+- **活动**:新建目标、看执行状态、批准/拒绝挂起的动作、token 用量和流水。
+- **配置**:模型预设 + API Key、事件源、SMTP、审批规则、预算。
+- **技能**:查看、新建、编辑、删除;名字和描述按同一套规则实时校验。
+
+数据位置(Windows 安装包):`%LOCALAPPDATA%\Programs\dots\` 下的
+`dot.toml`、`dot.db`、`workspace/`、`secrets.env`。密钥只写 `secrets.env`
+(启动时加载,已有的环境变量优先),`dot.toml` 里仍然只放变量名。
+源码/pip 模式默认用 `~/.dots/`,`-c` 可以指定别处。
+
 ## 命令
 
 | 命令 | 干什么 |
 |---|---|
+| `dots gui` | 起本地图形界面（聊天 / 活动 / 配置 / 技能），自动开浏览器 |
 | `dots` | 不带子命令 = 进交互终端。直接打字是对话,命令前加 `/` |
 | `dots init` | 生成 `dot.toml`,扫环境变量自动配好 `[model]`。`--global` 写到 `~/.dots/` |
 | `dots doctor` | 体检:配置、密钥、模型、目录、数据库、事件源逐项查 |

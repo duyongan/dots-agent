@@ -53,4 +53,4 @@ version = { attr = "dots.__version__" }
 
 [tool.setuptools.package-data]
 # dots init 要读这个模板。少了它,wheel 装完就 init 不了。
-dots = ["template.toml"]
+dots = ["template.toml", "webui/index.html", "webui/assets/*"]

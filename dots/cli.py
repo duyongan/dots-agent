@@ -67,6 +67,10 @@ def _parser() -> argparse.ArgumentParser:
     sv.add_argument("--once", action="store_true", help="只跑一轮就退")
     sv.add_argument("--web", action="store_true", help="同时起只读活动视图(只听本机)")
     sv.add_argument("--web-port", type=int, default=8765)
+    gu = sub.add_parser("gui", help="打开本地图形界面(聊天/配置/技能/审批)")
+    gu.add_argument("--port", type=int, default=8765)
+    gu.add_argument("--no-browser", action="store_true", help="只起服务,不开浏览器")
+    gu.add_argument("--dry-run", action="store_true", help="不真发邮件")
     sub.add_parser("selftest", help="不联网、不调模型,跑一遍自检")
     return p
 
@@ -82,6 +86,12 @@ def main(argv=None) -> int:
         return _cmd_selftest()
     if args.cmd == "doctor":
         return _cmd_doctor(args)
+    if args.cmd == "gui":
+        from dots import gui as gui_mod
+        return gui_mod.run_gui(
+            config=args.config, port=args.port,
+            open_browser=not args.no_browser, dry_run=args.dry_run,
+        )
 
     cfg = config_mod.load(args.config)
 
@@ -258,7 +268,7 @@ def _new_chat(args):
     conn = db.connect(cfg.db)
     db.init(conn)
     try:
-        agents, saver = worker.chat_agents(cfg, conn)
+        agents, saver, _ctx = worker.chat_agents(cfg, conn)
     except BaseException:
         conn.close()
         raise
@@ -319,15 +329,8 @@ def _cmd_init(args) -> int:
         print(f"{dest} 已经存在,没动它。体检一下:dots doctor")
         return 0
 
-    text = (Path(__file__).parent / "template.toml").read_text(encoding="utf-8")
     preset = config_mod.detect_model()
-    if preset:
-        name, base_url, key_env, _ = preset
-        body = [f'name = "{name}"']
-        body.append(f'base_url = "{base_url}"' if base_url else '# base_url = ""')
-        body.append(f'api_key_env = "{key_env}"' if key_env else '# api_key_env = ""')
-        body.append("")
-        text = _replace_section_body(text, "model", "\n".join(body))
+    text = config_mod.create_template_text(preset)
     dest.parent.mkdir(parents=True, exist_ok=True)
     dest.write_text(text, encoding="utf-8")
 
@@ -352,27 +355,6 @@ def _cmd_init(args) -> int:
         f"\n不带子命令直接敲 dots 会进交互终端,上面这些命令换个方式敲。\n"
     )
     return 0
-
-
-def _replace_section_body(text: str, section: str, body: str) -> str:
-    """把 [section] 下面的内容整段换掉,直到下一个 [ 开头的行。
-
-    比按行字符串替换稳:模板里的注释行随便改,这里都不会错位。
-    """
-    lines = text.splitlines()
-    out: list[str] = []
-    i, n = 0, len(lines)
-    while i < n:
-        if lines[i].strip() == f"[{section}]":
-            out.append(lines[i])
-            out.append(body)
-            i += 1
-            while i < n and not lines[i].lstrip().startswith("["):
-                i += 1
-            continue
-        out.append(lines[i])
-        i += 1
-    return "\n".join(out) + "\n"
 
 
 # --------------------------------------------------------------- 技能

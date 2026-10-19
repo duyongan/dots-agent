@@ -177,7 +177,8 @@ def test_plain_text_goes_to_the_agent_not_the_parser() -> str:
     """裸文本是「跟它说话」,不是命令 —— 这是这版交互的全部新意。"""
     seen: list = []
     real = cli.worker.chat_agents
-    cli.worker.chat_agents = lambda cfg, conn: ({"dot": _FakeAgent(seen)}, _FakeSaver())
+    cli.worker.chat_agents = lambda cfg, conn: (
+        {"dot": _FakeAgent(seen)}, _FakeSaver(), None)
     try:
         with _sandbox():
             out, code = _repl(["把 inbox 整理一下", "/ls", "再来一句"])

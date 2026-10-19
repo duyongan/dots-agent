@@ -3,7 +3,7 @@
 ; 产物：release\dots-setup-<版本>.exe
 
 #define MyAppName "dots"
-#define MyAppVersion "1.0.0"
+#define MyAppVersion "1.1.0"
 #define MyAppPublisher "duyongan"
 #define MyAppURL "https://github.com/duyongan/dots-agent"
 #define MyAppExeName "dots.exe"
@@ -36,8 +36,12 @@ Name: "addtopath"; Description: "把 dots 加入 PATH（推荐，之后在任何
 Source: "..\dist\dots\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Icons]
-Name: "{group}\dots（交互终端）"; Filename: "{app}\{#MyAppExeName}"
+Name: "{group}\dots（网页界面）"; Filename: "{app}\dots-gui.exe"; WorkingDir: "{app}"
+Name: "{group}\dots（命令行）"; Filename: "{app}\{#MyAppExeName}"; WorkingDir: "{app}"
 Name: "{group}\卸载 dots"; Filename: "{uninstallexe}"
+
+[Run]
+Filename: "{app}\dots-gui.exe"; Description: "打开 dots 界面"; WorkingDir: "{app}"; Flags: postinstall nowait skipifsilent
 
 [Registry]
 Root: HKCU; Subkey: "Environment"; ValueType: expandsz; ValueName: "Path"; ValueData: "{app};{olddata}"; Tasks: addtopath; Check: NeedsAddPath(ExpandConstant('{app}'))

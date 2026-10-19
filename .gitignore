@@ -21,6 +21,7 @@ release/
 .venv/
 .venv-build/
 venv/
+frontend/node_modules/
 .pytest_cache/
 .coverage
 htmlcov/

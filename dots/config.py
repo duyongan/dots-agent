@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import json
 import os
+import re
+import tempfile
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -297,3 +300,232 @@ def load(path: str | Path | None = None) -> Config:
         skills=skills,
         handoff=handoff,
     )
+
+
+# --------------------------------------------------------------- 写配置
+
+def template_path() -> Path:
+    return Path(__file__).parent / "template.toml"
+
+
+def replace_section_body(text: str, section: str, body: str) -> str:
+    """把 [section] 下面的内容整段换掉,直到下一个 [ 开头的行。
+
+    比按行字符串替换稳:模板里的注释行随便改,这里都不会错位。
+    """
+    lines = text.splitlines()
+    out: list[str] = []
+    i, n = 0, len(lines)
+    while i < n:
+        if lines[i].strip() == f"[{section}]":
+            out.append(lines[i])
+            out.append(body)
+            i += 1
+            while i < n and not lines[i].lstrip().startswith("["):
+                i += 1
+            continue
+        out.append(lines[i])
+        i += 1
+    return "\n".join(out) + "\n"
+
+
+def create_template_text(preset=None) -> str:
+    """模板原文;探测到模型时只替换 [model] 段。"""
+    text = template_path().read_text(encoding="utf-8")
+    if preset:
+        name, base_url, key_env, _ = preset
+        body = [f'name = "{name}"']
+        body.append(f'base_url = "{base_url}"' if base_url else '# base_url = ""')
+        body.append(f'api_key_env = "{key_env}"' if key_env else '# api_key_env = ""')
+        body.append("")
+        text = replace_section_body(text, "model", "\n".join(body))
+    return text
+
+
+def ensure_file(dest, preset=None) -> bool:
+    """不存在才写。返回是否新建。"""
+    p = Path(dest)
+    if p.exists():
+        return False
+    p.parent.mkdir(parents=True, exist_ok=True)
+    _atomic_write(p, create_template_text(preset))
+    return True
+
+
+def _atomic_write(path: Path, text: str) -> None:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=path.name + ".",
+                               suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="") as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def _toml_value(v) -> str:
+    if isinstance(v, bool):
+        return "true" if v else "false"
+    if isinstance(v, int):
+        return str(v)
+    if isinstance(v, float):
+        return repr(v)
+    if isinstance(v, str):
+        # JSON 的字符串语法和 TOML basic string 兼容,省得自己转义引号。
+        return json.dumps(v, ensure_ascii=False)
+    if isinstance(v, (list, tuple)):
+        return "[" + ", ".join(_toml_value(x) for x in v) + "]"
+    raise TypeError(f"不支持写进配置的类型:{type(v).__name__}")
+
+
+_KEY_LINE = re.compile(r"^\s*[A-Za-z0-9_.-]+\s*=")
+
+
+def _section_bounds(lines: list[str], section: str) -> tuple[int, int] | None:
+    header = f"[{section}]"
+    start = None
+    for i, line in enumerate(lines):
+        if line.strip() == header:
+            start = i
+            break
+    if start is None:
+        return None
+    end = len(lines)
+    for j in range(start + 1, len(lines)):
+        if lines[j].lstrip().startswith("["):
+            end = j
+            break
+    return start, end
+
+
+def apply_updates(text: str, updates: dict[str, dict]) -> str:
+    """按段改 key 的赋值行,其余注释和段原样保留。
+
+    只处理已知的标量/数组 key;不碰 [bots.*] 里的多行字符串。
+    """
+    lines = text.splitlines(keepends=True)
+
+    for section, kv in updates.items():
+        for key, value in kv.items():
+            if value is None:
+                continue
+            enc = _toml_value(value)
+            bounds = _section_bounds(lines, section)
+            if bounds is None:
+                if lines and not lines[-1].endswith("\n"):
+                    lines[-1] += "\n"
+                lines.append(f"\n[{section}]\n")
+                lines.append(f"{key} = {enc}\n")
+                continue
+
+            start, end = bounds
+            found = None
+            last_key = None
+            for i in range(start + 1, end):
+                if _KEY_LINE.match(lines[i]):
+                    last_key = i
+                m = re.match(r"^(\s*)" + re.escape(key) + r"\s*=", lines[i])
+                if m:
+                    found = i
+                    break
+
+            if found is not None:
+                line = lines[found]
+                nl = "\r\n" if line.endswith("\r\n") else ("\n" if line.endswith("\n") else "")
+                indent = re.match(r"^(\s*)", line).group(1)
+                lines[found] = f"{indent}{key} = {enc}{nl}"
+            else:
+                pos = (last_key if last_key is not None else start) + 1
+                if pos > 0 and not lines[pos - 1].endswith("\n"):
+                    lines[pos - 1] += "\n"
+                lines.insert(pos, f"{key} = {enc}\n")
+
+    return "".join(lines)
+
+
+def save_values(path, updates: dict[str, dict]) -> Path:
+    """改已有配置(不存在就从模板建)。写前用 tomllib 验一遍。"""
+    p = Path(path)
+    text = p.read_text(encoding="utf-8") if p.exists() else create_template_text()
+    new = apply_updates(text, updates)
+    tomllib.loads(new)                 # 语法不对就别落盘
+    _atomic_write(p, new)
+    return p
+
+
+# --------------------------------------------------------------- 密钥文件
+
+_SECRET_KEY = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def read_secrets(path) -> dict[str, str]:
+    """secrets.env 是 KEY=VALUE;值统一按 JSON 字符串写,也兼容裸值。"""
+    p = Path(path)
+    if not p.exists():
+        return {}
+    out: dict[str, str] = {}
+    for raw in p.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[7:].lstrip()
+        if "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key, value = key.strip(), value.strip()
+        if not _SECRET_KEY.match(key):
+            continue
+        if len(value) >= 2 and value[0] == value[-1] == '"':
+            try:
+                value = json.loads(value)
+            except ValueError:
+                value = value[1:-1]
+        elif len(value) >= 2 and value[0] == value[-1] == "'":
+            value = value[1:-1]
+        out[key] = value
+    return out
+
+
+def write_secrets(path, values: dict[str, str]) -> dict[str, str]:
+    """合并写入;传空字符串等于删除。返回写完后的全量。"""
+    p = Path(path)
+    merged = read_secrets(p)
+    for key, value in values.items():
+        if not _SECRET_KEY.match(key):
+            raise ValueError(f"环境变量名不合法:{key!r}")
+        value = str(value)
+        if "\n" in value or "\r" in value:
+            raise ValueError(f"{key} 的值里有换行")
+        if value == "":
+            merged.pop(key, None)
+        else:
+            merged[key] = value
+    lines = [
+        "# dots 本机密钥。由界面写入,也可以手改;启动时加载,已有的环境变量优先。",
+        "",
+    ]
+    for key in sorted(merged):
+        lines.append(f"{key}={json.dumps(merged[key], ensure_ascii=False)}")
+    _atomic_write(p, "\n".join(lines) + "\n")
+    try:
+        os.chmod(p, 0o600)
+    except OSError:
+        pass
+    return merged
+
+
+def load_secrets(path) -> dict[str, str]:
+    """读进进程环境。已经存在的环境变量不覆盖。"""
+    values = read_secrets(path)
+    for key, value in values.items():
+        os.environ.setdefault(key, value)
+    return values
