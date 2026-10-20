@@ -37,14 +37,14 @@ python -m dots serve
 %LOCALAPPDATA%\Programs\dots\dots.exe
 ```
 
-`dots-0.1.0-setup.exe` 只是**安装器**,装一次就行,不是日常打开方式。
+`dots-<版本>-setup.exe` 只是**安装器**,装一次就行,不是日常打开方式。
 
 #### 安装
 
 安装包由打包命令生成到 `release/`(该目录不进仓库):
 
 ```text
-release/dots-0.1.0-setup.exe
+release/dots-<版本>-setup.exe
 ```
 
 双击安装。安装器是**按用户安装**,不需要管理员权限,默认装到
@@ -61,7 +61,7 @@ release/dots-0.1.0-setup.exe
 ```bash
 cd desktop
 bash make-runtime.sh      # 首次,或 dots/ 源码改动后
-npm run dist              # 生成 release/dots-0.1.0-setup.exe
+npm run dist              # 生成 release/dots-<版本>-setup.exe
 ```
 
 #### 在仓库里开发
@@ -444,9 +444,9 @@ dots gui
 配置(模型预设 + API Key、事件源、SMTP、审批规则、预算)、技能(增删改查)。
 写操作要带页面内生成的随机 token,只监听本机。
 
-Windows 的 `dots-setup-*.exe` 安装包里也带这个界面(开始菜单「dots(网页界面)」,
-无控制台启动器 `dots-gui.exe`)。安装版把配置、数据库、工作区和密钥放在安装目录
-(`%LOCALAPPDATA%\Programs\dots`),源码/pip 模式默认用 `~/.dots/`。
+源码/pip 模式默认用 `~/.dots/`。1.1.x 的 Windows 安装包里也带这个界面
+(开始菜单「dots(网页界面)」,无控制台启动器 `dots-gui.exe`);1.2.0 起的
+桌面版是 Electron 窗口,内置的不是这套网页。
 
 ## 命令
 
