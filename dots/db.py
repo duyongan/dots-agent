@@ -90,6 +90,9 @@ ACTIVE = (READY, RUNNING, INTERRUPTED)
 def now() -> float:
     return time.time()
 
+def old() -> float:
+    return time.time()
+
 
 def new_id() -> str:
     return secrets.token_hex(3)
