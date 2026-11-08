@@ -1296,7 +1296,9 @@ def _table(rows, headers) -> str:
     for r in rows:
         for i, c in enumerate(r):
             widths[i] = max(widths[i], _w(c))
-    out = ["  ".join(str(h).ljust(widths[i] + _w(h) - len(str(h))) for i, h in enumerate(headers))]
+    # 表头也按显示宽度补,别用 len():中文占两格,用 len 补出来的表头会比数据行宽,
+    # 整张表看着像错位(以前就是这样)。
+    out = ["  ".join(_pad(h, widths[i]) for i, h in enumerate(headers))]
     out.append("  ".join("-" * w for w in widths))
     for r in rows:
         out.append("  ".join(_pad(c, widths[i]) for i, c in enumerate(r)))
