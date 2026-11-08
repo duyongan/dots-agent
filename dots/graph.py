@@ -13,6 +13,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import threading
@@ -26,9 +27,14 @@ from langchain_core.tools import tool
 from langgraph.types import interrupt
 
 from dots import approvals, db
+from dots import mcp as mcp_mod
+from dots import ontology as ontology_mod
 from dots import rules as rules_mod
 from dots import skills as skills_mod
-from dots.prompts import CHAT_PROMPT, SCOUT_PROMPT, SYSTEM_PROMPT
+from dots.prompts import (
+    CHAT_PROMPT, IMPLEMENTER_PROMPT, MCP_GUIDE, ONTOLOGY_GUIDE, SCOUT_PROMPT,
+    SYSTEM_PROMPT,
+)
 
 SHELL_TIMEOUT = 120
 
@@ -204,6 +210,29 @@ def make_tools(ctx: RunCtx, bot_cfg=None):
         return f"已存到 {path}。下轮开跑时才会进索引。"
 
     @tool
+    def ontology_lookup(query: str, limit: int = 5) -> str:
+        """查本体库:实体、字段、枚举、关系。写文档和代码之前先查它。
+
+        query 可以是实体名(中文或英文)、表名、字段名。返回实体的完整定义。
+        本体库里没有的东西,不要自己造 —— 写进「待确认问题」。
+        """
+        if not getattr(ctx.cfg, "ontology", None) or not ctx.cfg.ontology.enabled:
+            return "本体库被关掉了([ontology] enabled = false)。"
+        doc = ontology_mod.load(ctx.cfg)
+        try:
+            n = max(1, min(int(limit), 20))
+        except (TypeError, ValueError):
+            n = 5
+        hits = ontology_mod.lookup(doc, query, limit=n)
+        if not hits:
+            return (
+                f"本体库里没有匹配 {query!r} 的实体。"
+                f"别造字段名 —— 把需要的东西写进「待确认问题」,或者先跑 dots ontology sync。"
+            )
+        db.audit(ctx.conn, ctx.goal_id, "ontology_lookup", f"{query} -> {len(hits)}")
+        return json.dumps(hits, ensure_ascii=False, indent=2)[:6000]
+
+    @tool
     def handoff_to(bot: str, reason: str, note: str) -> str:
         """把这个目标交给另一个 bot。交出去之后你这一轮就结束了。
 
@@ -280,12 +309,54 @@ def make_tools(ctx: RunCtx, bot_cfg=None):
         db.audit(ctx.conn, ctx.goal_id, "run_shell", f"{cmd[:100]} -> {proc.returncode}")
         return f"exit={proc.returncode}\n{out[:4000]}"
 
-    tools = [complete_goal, create_goal, save_skill, handoff_to, send_email, run_shell]
+    tools = [complete_goal, create_goal, save_skill, handoff_to, send_email,
+             run_shell, ontology_lookup]
 
     allowed = list(getattr(bot_cfg, "tools", []) or [])
     if allowed:
         tools = [t for t in tools if t.name in CORE_TOOLS or t.name in allowed]
     return tools
+
+
+def context_prompt(cfg) -> str:
+    """拼在系统提示后面的「这一轮的世界状况」:本体库 + 接上的外部系统。
+
+    每次 build 只算一次。本体库改了要重建图才生效 —— 常驻进程本来每轮 tick 前
+    就会重读配置,重启一次是正常操作,别在这里每轮读盘。
+    """
+    parts: list[str] = []
+    if getattr(cfg, "ontology", None) and cfg.ontology.enabled and cfg.ontology.inject_prompt:
+        doc = ontology_mod.load(cfg)
+        text = ontology_mod.context(
+            doc, limit=int(getattr(cfg.ontology, "prompt_entities", 40) or 40)
+        )
+        if text:
+            parts.append(ONTOLOGY_GUIDE + "\n" + text)
+    if getattr(cfg, "mcp", None) and cfg.mcp.enabled:
+        desc = mcp_mod.describe(cfg)
+        if desc:
+            parts.append(MCP_GUIDE + "\n" + desc)
+    return "\n\n".join(parts)
+
+
+def load_mcp_tools(cfg, ctx: RunCtx, bot_cfg):
+    """把 MCP 工具接进来,并套上同一套审批闸门。
+
+    连不上就算了:返回空列表 + 一句说明。它不能让 tick 起不来。
+    """
+    try:
+        tools, notes = mcp_mod.load_tools(cfg)
+    except Exception as e:                  # noqa: BLE001 - MCP 是增强,不是命脉
+        print(f"[dot] MCP 工具不可用:{type(e).__name__}: {e}")
+        return []
+    if not tools:
+        return []
+    allowed = list(getattr(bot_cfg, "tools", []) or [])
+    if allowed:
+        tools = [t for t in tools if t.name in allowed]
+    if not tools:
+        return []
+    return mcp_mod.gated(tools, lambda action, args: _gate(ctx, action, args))
 
 
 # --------------------------------------------------------------------- 组装
@@ -326,6 +397,10 @@ def build(cfg, checkpointer, ctx: RunCtx, bot: str = "dot", chat: bool = False):
         prompt = f"{SYSTEM_PROMPT}\n---\n\n{bot_cfg.prompt}"
     if chat:
         prompt = f"{prompt}\n---\n\n{CHAT_PROMPT}"
+    else:
+        extra = context_prompt(cfg)
+        if extra:
+            prompt = f"{prompt}\n---\n\n{extra}"
 
     kwargs: dict = {}
     if cfg.skills.enabled:
@@ -333,20 +408,36 @@ def build(cfg, checkpointer, ctx: RunCtx, bot: str = "dot", chat: bool = False):
         # 所以 agent 自己写的新技能下次开跑就生效。
         kwargs["skills"] = [f"/{cfg.skills.dir}/"]
 
+    tools = make_tools(ctx, bot_cfg)
+    if not chat:
+        tools = tools + load_mcp_tools(cfg, ctx, bot_cfg)
+
+    subagents = [
+        SubAgent(
+            name="scout",
+            description=(
+                "只读研究员。把一个「需要翻很多文件才能回答」的问题交给它,"
+                "它只回摘要,不把原文带回来。"
+            ),
+            system_prompt=SCOUT_PROMPT,
+        )
+    ]
+    if bot in ("dev", "fixer") and not chat:
+        # 视频里那套做法:任务拆到最小单元后并行分给子 agent,每个子任务自测。
+        subagents.append(SubAgent(
+            name="implementer",
+            description=(
+                "实现一个已经拆分好的最小任务。把任务文件路径和一个明确的验收点"
+                "交给它,它改代码并自测,只回结果和改动文件清单。"
+            ),
+            system_prompt=IMPLEMENTER_PROMPT,
+        ))
+
     return create_deep_agent(
         model=build_model(cfg),
-        tools=make_tools(ctx, bot_cfg),
+        tools=tools,
         system_prompt=prompt,
-        subagents=[
-            SubAgent(
-                name="scout",
-                description=(
-                    "只读研究员。把一个「需要翻很多文件才能回答」的问题交给它,"
-                    "它只回摘要,不把原文带回来。"
-                ),
-                system_prompt=SCOUT_PROMPT,
-            )
-        ],
+        subagents=subagents,
         # 沙箱边界就是这个 root_dir —— 不是内核隔离,是路径约束。
         # virtual_mode=True 是必须的:默认 False 时绝对路径和 ".." 能绕出 root_dir,
         # 那这个「沙箱」就只是句好话。设了它,越界路径会被拒。

@@ -10,7 +10,7 @@ import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from dots.prompts import BOT_PROMPTS
+from dots.prompts import BOT_PROMPTS, SDLC_BOTS
 
 DEFAULT_FILENAME = "dot.toml"
 
@@ -133,10 +133,103 @@ class ICalSubject:
 
 
 @dataclass
+class WeChatSubject:
+    """微信群监控。消息由外部桥(Wechaty/wechatferry/RPA)写进 spool,这里只读。
+
+    这样做的好处:读群消息的脏活(登录、风控、UI 自动化)留在桥里,
+    dots 只认一个追加写的 JSONL 文件。桥挂了、换了,这边一行不用改。
+    """
+    enabled: bool = False
+    # workspace 下的相对路径。JSONL,一行一条消息,由桥 append。
+    spool: str = "wechat/inbox.jsonl"
+    # 只看这些群。空 = 全部群。
+    groups: list[str] = field(default_factory=list)
+    # 判定「这是 BUG」的关键词。空 = 用 bugs.DEFAULT_KEYWORDS。
+    keywords: list[str] = field(default_factory=list)
+    interval: int = 60
+    # 一次最多读多少条新消息。桥的 backlog 很大时慢慢追,别让一轮 tick 变批处理。
+    max_batch: int = 100
+    # webhook 的鉴权 token 走环境变量;留空 = 不校验(仍然只听 127.0.0.1)
+    token_env: str = "DOT_WECHAT_TOKEN"
+
+    @property
+    def token(self) -> str:
+        return _env(self.token_env)
+
+
+@dataclass
 class Sources:
     fs: FSSubject = field(default_factory=FSSubject)
     imap: IMAPSubject = field(default_factory=IMAPSubject)
     ical: ICalSubject = field(default_factory=ICalSubject)
+    wechat: WeChatSubject = field(default_factory=WeChatSubject)
+
+
+@dataclass
+class MCPServerCfg:
+    """一个 MCP server = 一个外部系统(飞书 / Jira / Sigma / GitLab ...)。
+
+    密钥只走环境变量:`env` 写固定值(项目 key 之类),`pass_env` 列要透传的变量名。
+    """
+    name: str
+    enabled: bool = True
+    # stdio: 起子进程; sse / streamable_http: 连已有服务
+    transport: str = "stdio"
+    command: str = ""
+    args: list[str] = field(default_factory=list)
+    url: str = ""
+    env: dict[str, str] = field(default_factory=dict)
+    pass_env: list[str] = field(default_factory=list)
+    timeout: float = 60.0
+    # 工具名前缀。默认就是 server 名,免得两个系统都有 create_issue 撞名。
+    prefix: str = ""
+
+
+@dataclass
+class MCPCfg:
+    enabled: bool = False
+    servers: dict[str, MCPServerCfg] = field(default_factory=dict)
+
+
+@dataclass
+class DataSourceCfg:
+    """一个被采集元数据的库。连接串走环境变量,不写进 dot.toml。"""
+    name: str
+    kind: str = "postgres"        # postgres | mysql | mongodb
+    dsn_env: str = ""             # 完整连接串所在的环境变量名
+    schema: str = "public"        # 关系库的 schema;mongo 忽略
+    database: str = ""
+    include: list[str] = field(default_factory=list)   # 只看这些表/集合(支持通配)
+    exclude: list[str] = field(default_factory=list)
+    sample_size: int = 50         # mongo 采样条数 / 关系库取低基数枚举的样本量
+
+
+@dataclass
+class OntologyCfg:
+    enabled: bool = True
+    # workspace 下的相对路径:ontology.json + history/
+    dir: str = "ontology"
+    # 派生出来的文档和代码写这里(generated 目录整体可重建,别手改)
+    derived: str = "generated"
+    datasources: dict[str, DataSourceCfg] = field(default_factory=dict)
+    # 每轮把本体摘要塞进系统提示。关掉就只靠 ontology_lookup 工具按需查。
+    inject_prompt: bool = True
+    # 派生文件里塞进系统提示的实体上限,防止大库把提示撑爆
+    prompt_entities: int = 40
+
+
+@dataclass
+class SDLCCfg:
+    """需求 → 原型 → 开发 → 测试 → 修复 的全流程。"""
+    enabled: bool = True
+    # workspace 下的相对路径,一条流水线一个子目录
+    dir: str = "projects"
+    # 测试不过 → 修复 → 再测,最多来回几次。防止死循环烧 token。
+    max_fix_rounds: int = 3
+    # 微信群报的 BUG 自动起一条修复流水线
+    auto_from_bug: bool = True
+    # 覆盖默认阶段序列(feature: requirements/prototype/dev/test)
+    stages: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -180,6 +273,9 @@ class Config:
     bots: dict[str, BotCfg] = field(default_factory=dict)
     skills: SkillsCfg = field(default_factory=SkillsCfg)
     handoff: HandoffCfg = field(default_factory=HandoffCfg)
+    mcp: MCPCfg = field(default_factory=MCPCfg)
+    ontology: OntologyCfg = field(default_factory=OntologyCfg)
+    sdlc: SDLCCfg = field(default_factory=SDLCCfg)
 
     def bot(self, name: str) -> BotCfg:
         """没配过的 bot 名字也给一个默认,别因为笔误就崩。"""
@@ -239,6 +335,7 @@ def load(path: str | Path | None = None) -> Config:
 
     src = _sub(raw, "sources")
     f, i, c = _sub(src, "fs"), _sub(src, "imap"), _sub(src, "ical")
+    w = _sub(src, "wechat")
     sources = Sources(
         fs=FSSubject(
             enabled=bool(f.get("enabled", True)),
@@ -259,6 +356,15 @@ def load(path: str | Path | None = None) -> Config:
             enabled=bool(c.get("enabled", False)),
             url=c.get("url", ""),
             interval=int(c.get("interval", 900)),
+        ),
+        wechat=WeChatSubject(
+            enabled=bool(w.get("enabled", False)),
+            spool=str(w.get("spool", "wechat/inbox.jsonl")).strip("/") or "wechat/inbox.jsonl",
+            groups=[str(x) for x in (w.get("groups") or [])],
+            keywords=[str(x) for x in (w.get("keywords") or [])],
+            interval=int(w.get("interval", 60)),
+            max_batch=int(w.get("max_batch", 100)),
+            token_env=str(w.get("token_env", "DOT_WECHAT_TOKEN")),
         ),
     )
 
@@ -284,6 +390,65 @@ def load(path: str | Path | None = None) -> Config:
     ho = _sub(raw, "handoff")
     handoff = HandoffCfg(max_hops=int(ho.get("max_hops", 3)))
 
+    # ---- 外部系统的 MCP server。名字就是工具前缀,别用中文。
+    mc = _sub(raw, "mcp")
+    servers: dict[str, MCPServerCfg] = {}
+    for name, spec in _sub(mc, "servers").items():
+        spec = spec if isinstance(spec, dict) else {}
+        servers[str(name)] = MCPServerCfg(
+            name=str(name),
+            enabled=bool(spec.get("enabled", True)),
+            transport=str(spec.get("transport", "stdio")).strip().lower() or "stdio",
+            command=str(spec.get("command", "")),
+            args=[str(x) for x in (spec.get("args") or [])],
+            url=str(spec.get("url", "")),
+            env={str(k): str(v) for k, v in _sub(spec, "env").items()},
+            pass_env=[str(x) for x in (spec.get("pass_env") or [])],
+            timeout=float(spec.get("timeout", 60.0)),
+            prefix=str(spec.get("prefix") or name),
+        )
+    # 配了 server 就当开了;显式写 enabled = false 才关。
+    mcp = MCPCfg(enabled=bool(mc.get("enabled", bool(servers))), servers=servers)
+
+    # ---- 本体库。元数据从公司库采,人工可编,派生文档和代码。
+    on = _sub(raw, "ontology")
+    dss: dict[str, DataSourceCfg] = {}
+    for name, spec in _sub(on, "datasources").items():
+        spec = spec if isinstance(spec, dict) else {}
+        dss[str(name)] = DataSourceCfg(
+            name=str(name),
+            kind=_db_kind(spec.get("kind", "postgres")),
+            dsn_env=str(spec.get("dsn_env", "")),
+            schema=str(spec.get("schema", "public")),
+            database=str(spec.get("database", "")),
+            include=[str(x) for x in (spec.get("include") or [])],
+            exclude=[str(x) for x in (spec.get("exclude") or [])],
+            sample_size=int(spec.get("sample_size", 50)),
+        )
+    ontology = OntologyCfg(
+        enabled=bool(on.get("enabled", True)),
+        dir=str(on.get("dir", "ontology")).strip("/") or "ontology",
+        derived=str(on.get("derived", "generated")).strip("/") or "generated",
+        datasources=dss,
+        inject_prompt=bool(on.get("inject_prompt", True)),
+        prompt_entities=int(on.get("prompt_entities", 40)),
+    )
+
+    # ---- 全流程流水线
+    sd = _sub(raw, "sdlc")
+    sdlc = SDLCCfg(
+        enabled=bool(sd.get("enabled", True)),
+        dir=str(sd.get("dir", "projects")).strip("/") or "projects",
+        max_fix_rounds=int(sd.get("max_fix_rounds", 3)),
+        auto_from_bug=bool(sd.get("auto_from_bug", True)),
+        stages=[str(x) for x in (sd.get("stages") or [])],
+    )
+
+    # 流水线的五个阶段 bot 必须有:目标行里写着 bot 名,少一张图那一轮就直接跑不起来。
+    if sdlc.enabled:
+        for name in SDLC_BOTS:
+            bots.setdefault(name, BotCfg(name=name, prompt=BOT_PROMPTS.get(name, "")))
+
     return Config(
         root=root,
         workspace=_path(root, dot.get("workspace", "workspace")),
@@ -299,7 +464,24 @@ def load(path: str | Path | None = None) -> Config:
         bots=bots,
         skills=skills,
         handoff=handoff,
+        mcp=mcp,
+        ontology=ontology,
+        sdlc=sdlc,
     )
+
+
+_DB_KIND_ALIASES = {
+    "postgres": "postgres", "postgresql": "postgres", "pg": "postgres",
+    "psql": "postgres", "greenplum": "postgres", "kingbase": "postgres",
+    "mysql": "mysql", "mariadb": "mysql", "tidb": "mysql", "oceanbase": "mysql",
+    "mongodb": "mongodb", "mongo": "mongodb",
+}
+
+
+def _db_kind(value) -> str:
+    """库类型归一。用户写 pg/mongo/mariadb 都认,写别的原样留着(采集时会报不支持)。"""
+    text = str(value or "").strip().lower()
+    return _DB_KIND_ALIASES.get(text, text or "postgres")
 
 
 # --------------------------------------------------------------- 写配置

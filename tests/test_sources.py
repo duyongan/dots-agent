@@ -371,6 +371,9 @@ def test_imap_unreachable_is_not_fatal() -> str:
                 password="p", folder="INBOX", verify_tls=False, interval=60,
             ),
             ical=SimpleNamespace(enabled=False, url="", interval=60),
+            wechat=SimpleNamespace(enabled=False, spool="wechat/inbox.jsonl",
+                                   groups=[], keywords=[], interval=60,
+                                   max_batch=100, token_env="X", token=""),
         )
     )
     events = sources.poll_all(cfg, conn)

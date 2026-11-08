@@ -40,6 +40,7 @@ def poll_all(cfg, conn) -> list[Event]:
         ("fs", fs_poll, cfg.sources.fs.enabled),
         ("imap", imap_poll, cfg.sources.imap.enabled),
         ("ical", ical_poll, cfg.sources.ical.enabled),
+        ("wechat", wechat_poll, cfg.sources.wechat.enabled),
     ):
         if not enabled:
             continue
@@ -372,6 +373,33 @@ def _parse_dt(value: str, params: str = "") -> datetime | None:
         if zone is not None:
             return naive.replace(tzinfo=zone).astimezone(timezone.utc)
     return naive.replace(tzinfo=timezone.utc)
+
+
+# --------------------------------------------------------------------- 微信群
+
+def wechat_poll(cfg, conn, cursor: str):
+    """读 spool 里的新群消息,只把「像 BUG 的」放出去。
+
+    判定和去重**不在这里**:源只负责读,分组和关键词过滤是最轻的那层。
+    指纹、台账、起流水线全在 worker/bugs —— 源不该知道业务。
+
+    偏移按「读完的整行」推进,桥写到一半的行留到下次 —— 见 wechat.read_new。
+    只过滤事件、不丢消息:偏移照常前进,不匹配的消息自然被跳过。
+    """
+    from dots import bugs as bugs_mod, wechat
+
+    sub = cfg.sources.wechat
+    messages, new_cursor = wechat.read_new(
+        cfg, cursor, limit=int(sub.max_batch or 100)
+    )
+    events: list[Event] = []
+    for msg in messages:
+        if not wechat.groups_allowed(cfg, msg):
+            continue
+        if not bugs_mod.should_report(msg.text, sub.keywords or None):
+            continue
+        events.append(Event(source="wechat", key=msg.key, payload=msg.as_dict()))
+    return events, new_cursor
 
 
 def demo() -> None:

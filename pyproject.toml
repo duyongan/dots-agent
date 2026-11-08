@@ -32,6 +32,10 @@ dependencies = [
 [project.optional-dependencies]
 # 只有跑测试要用:生成自签证书起本地假 IMAP 服务器
 test = ["cryptography>=41", "pytest>=8"]
+# MCP 接入(飞书/Jira/Sigma/GitLab)。不装也能跑,只是没有外部系统工具。
+mcp = ["langchain-mcp-adapters>=0.1"]
+# 本体库采集元数据。按你要采的库装其中几个即可,不装就只能手工写本体。
+ontology = ["psycopg[binary]>=3.1", "pymysql>=1.1", "pymongo>=4.6"]
 
 [project.scripts]
 dots = "dots.cli:main"

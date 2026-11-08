@@ -8,7 +8,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import shlex
+import subprocess
 import sys
 import unicodedata
 from datetime import datetime
@@ -53,6 +55,64 @@ def _parser() -> argparse.ArgumentParser:
     sk_rm = sk_sub.add_parser("rm", help="删掉一份技能")
     sk_rm.add_argument("name")
     sub.add_parser("curate", help="整理技能库:合并重复、删掉没价值的")
+
+    mc = sub.add_parser("mcp", help="MCP 接入:飞书 / Jira / Sigma / GitLab")
+    mc_sub = mc.add_subparsers(dest="mcp_cmd", required=True)
+    mc_sub.add_parser("list", help="看接了哪些外部系统、缺什么")
+    mc_add = mc_sub.add_parser("add", help="把一家现成的 MCP 配置写进 dot.toml")
+    from dots import mcp as _mcp_mod          # 纯配置模块,不引 langchain
+    mc_add.add_argument("preset", choices=sorted(_mcp_mod.PRESETS))
+    mc_add.add_argument("--force", action="store_true", help="已存在也覆盖")
+
+    on = sub.add_parser("ontology", help="本体库:采集元数据 / 手改 / 派生文档和代码")
+    on_sub = on.add_subparsers(dest="ontology_cmd", required=True)
+    on_sub.add_parser("init", help="建一份空的 ontology.json")
+    on_show = on_sub.add_parser("show", help="看实体列表,或某个实体的完整定义")
+    on_show.add_argument("entity", nargs="?")
+    on_sub.add_parser("edit", help="用编辑器手改本体库,存完自动校验并派生")
+    on_sub.add_parser("validate", help="校验本体库")
+    on_sync = on_sub.add_parser("sync", help="从公司库采元数据并合并进本体库")
+    on_sync.add_argument("source", nargs="?", help="只采某个数据源(默认全部)")
+    on_sub.add_parser("apply", help="按本体库重新生成派生文档和代码")
+    on_sub.add_parser("status", help="派生层是否跟本体库一致")
+
+    sd = sub.add_parser("sdlc", help="全流程流水线:需求→原型→开发→测试→修复")
+    sd_sub = sd.add_subparsers(dest="sdlc_cmd", required=True)
+    sd_new = sd_sub.add_parser("new", help="开一条流水线")
+    sd_new.add_argument("text", nargs="+", help="需求原文")
+    sd_new.add_argument("--title", default="", help="标题(默认取需求第一行)")
+    sd_new.add_argument("--track", default="feature", choices=("feature", "bugfix"))
+    sd_new.add_argument("--jira", default="", help="关联的 Jira 单号")
+    sd_sub.add_parser("ls", help="列出流水线")
+    sd_show = sd_sub.add_parser("show", help="看一条流水线的详情")
+    sd_show.add_argument("id")
+    sd_sub.add_parser("sync", help="把本体库变更同步进所有流水线文档")
+    sd_adv = sd_sub.add_parser("advance", help="人工跳过当前阶段(卡住时用)")
+    sd_adv.add_argument("id")
+    sd_adv.add_argument("--note", default="人工跳过")
+
+    bg = sub.add_parser("bugs", help="缺陷台账(微信群报的 BUG 都在这儿)")
+    bg_sub = bg.add_subparsers(dest="bugs_cmd")
+    bg_ls = bg_sub.add_parser("ls", help="列缺陷")
+    bg_ls.add_argument("--status", help="只看某个状态(open/fixing/fixed/closed)")
+    bg_show = bg_sub.add_parser("show", help="看一条缺陷")
+    bg_show.add_argument("id")
+    bg_close = bg_sub.add_parser("close", help="关掉一条缺陷")
+    bg_close.add_argument("id")
+    bg_fix = bg_sub.add_parser("fix", help="给一条或多条缺陷开修复流水线")
+    bg_fix.add_argument("ids", nargs="+")
+    bg_fix.add_argument("--title", default="")
+
+    wx = sub.add_parser("wechat", help="微信群监控(spool / webhook)")
+    wx_sub = wx.add_subparsers(dest="wechat_cmd", required=True)
+    wx_in = wx_sub.add_parser("ingest", help="手动灌一条消息(补录/联调)")
+    wx_in.add_argument("text", nargs="+")
+    wx_in.add_argument("--group", default="")
+    wx_in.add_argument("--sender", default="")
+    wx_hook = wx_sub.add_parser("hook", help="起本机 webhook,接收桥推来的消息")
+    wx_hook.add_argument("--port", type=int, default=8790)
+    wx_sub.add_parser("status", help="spool 在哪、读到哪了")
+
     s = sub.add_parser("ls", help="列目标")
     s.add_argument("--status", help="只看某个状态")
     lg = sub.add_parser("log", help="活动记录")
@@ -164,6 +224,17 @@ def _dispatch(args, cfg, conn) -> int:
         return _cmd_skills(cfg)
     if args.cmd == "skill":
         return _cmd_skill(cfg, args.skill_cmd, args.name)
+
+    if args.cmd == "mcp":
+        return _cmd_mcp(args, cfg)
+    if args.cmd == "ontology":
+        return _cmd_ontology(args, cfg)
+    if args.cmd == "sdlc":
+        return _cmd_sdlc(args, cfg, conn)
+    if args.cmd == "bugs":
+        return _cmd_bugs(args, cfg, conn)
+    if args.cmd == "wechat":
+        return _cmd_wechat(args, cfg)
 
     if args.cmd == "ls":
         return _cmd_ls(conn, args.status)
@@ -486,6 +557,400 @@ def _cmd_skill(cfg, action: str, name: str) -> int:
 
 # --------------------------------------------------------------- 体检
 
+def _cmd_mcp(args, cfg) -> int:
+    from dots import mcp as mcp_mod
+
+    if args.mcp_cmd == "add":
+        dest = config_mod.resolve(args.config)
+        if dest is None:
+            print("先 dots init 生成一份配置,再往里面加 MCP。", file=sys.stderr)
+            return 2
+        mcp_mod.add_preset(dest, args.preset, force=args.force)
+        preset = mcp_mod.PRESETS[args.preset]
+        print(f"写好了 {dest} 的 [mcp.servers.{args.preset}]({preset['title']})。")
+        if preset.get("pass_env"):
+            print("凭据放环境变量,别写进配置文件:")
+            for name in preset["pass_env"]:
+                print(f"  export {name}=...   # Windows: $env:{name}=\"...\"")
+        print(f"提示:{preset['note']}")
+        print("检查:dots mcp list")
+        return 0
+
+    if not cfg.mcp.servers:
+        print("还没配 MCP server。接入一家:dots mcp add jira|feishu|gitlab|sigma")
+        return 0
+    try:
+        mcp_mod.adapter()
+        has_adapter = True
+    except ImportError:
+        has_adapter = False
+
+    rows = []
+    for name, server in cfg.mcp.servers.items():
+        preset = mcp_mod.PRESETS.get(name)
+        title = preset["title"] if preset else ""
+        missing = [x for x in (server.pass_env or []) if not os.environ.get(x)]
+        if not server.enabled:
+            state = "关"
+        elif server.transport == "stdio" and not server.command:
+            state = "配置不全:缺 command"
+        elif server.transport != "stdio" and not server.url:
+            state = "配置不全:缺 url"
+        elif missing:
+            state = "缺环境变量:" + ",".join(missing)
+        else:
+            state = "就绪"
+        rows.append((name, title, server.transport, state))
+    print(_table(rows, ("NAME", "系统", "TRANSPORT", "状态")))
+    if not has_adapter:
+        print("\n没装 langchain-mcp-adapters,工具还挂不上:pip install 'dots-agent[mcp]'")
+    elif not cfg.mcp.enabled:
+        print("\n[mcp] enabled = false —— 配了也不会连。")
+    print("\n工具名带前缀(jira__create_issue),审批规则可以按系统写通配:jira__* = \"ask\"")
+    return 0
+
+
+def _cmd_ontology(args, cfg) -> int:
+    from dots import ontology as ont
+    from dots import sdlc as sdlc_mod
+
+    if not cfg.ontology.enabled:
+        print("本体库被关掉了([ontology] enabled = false)。", file=sys.stderr)
+        return 2
+
+    if args.ontology_cmd == "init":
+        p = ont.path(cfg)
+        if p.exists():
+            print(f"{p} 已经存在,没动它。看内容:dots ontology show")
+            return 0
+        ont.save(cfg, ont.empty(), note="init")
+        print(f"建好了 {p}。")
+        print("有数据库:先在 [ontology.datasources.*] 配 dsn_env,再 dots ontology sync")
+        print("纯手工:直接 dots ontology edit 写实体")
+        return 0
+
+    if args.ontology_cmd == "show":
+        doc = ont.load(cfg)
+        if args.entity:
+            ent = ont.find_entity(doc, args.entity)
+            if ent is None:
+                print(f"没有叫 {args.entity!r} 的实体。", file=sys.stderr)
+                return 1
+            print(json.dumps(ent, ensure_ascii=False, indent=2))
+            return 0
+        ents = doc.get("entities") or []
+        if not ents:
+            print(f"本体库是空的({ont.path(cfg)})。")
+            print("dots ontology sync(从库采)或 dots ontology edit(手写)")
+            return 0
+        rows = [
+            (e.get("id"), e.get("label"), len(e.get("fields") or []),
+             (e.get("source") or {}).get("table") or "-",
+             "改过" if e.get("curated") else (e.get("status") or "draft"),
+             "库中已无" if e.get("missing") else "")
+            for e in ents
+        ]
+        print(_table(rows, ("ID", "名称", "字段", "物理表", "状态", "备注")))
+        print(f"\n{len(ents)} 个实体 · 指纹 {ont.digest(doc)} · {ont.path(cfg)}")
+        print("看某个:dots ontology show <id>    手改:dots ontology edit")
+        return 0
+
+    if args.ontology_cmd == "validate":
+        problems = ont.validate(ont.load(cfg))
+        if problems:
+            print("校验不过:")
+            for x in problems:
+                print(f"  - {x}")
+            return 1
+        print("本体库校验通过。")
+        return 0
+
+    if args.ontology_cmd == "edit":
+        p = ont.path(cfg)
+        if not p.exists():
+            ont.save(cfg, ont.empty(), note="init")
+        editor = os.environ.get("EDITOR") or os.environ.get("VISUAL") or (
+            "notepad" if os.name == "nt" else "vi")
+        print(f"编辑 {p}({editor})。存盘后会自动校验并重新生成派生文件。")
+        try:
+            subprocess.call([editor, str(p)])
+        except OSError as e:
+            print(f"打不开编辑器({e})。直接改这个文件,然后跑 dots ontology apply:\n  {p}",
+                  file=sys.stderr)
+            return 1
+        problems = ont.validate(ont.load(cfg))
+        if problems:
+            print("改完的 JSON 校验不过,派生文件没有动:", file=sys.stderr)
+            for x in problems:
+                print(f"  - {x}", file=sys.stderr)
+            return 1
+        return _apply_ontology(cfg, note="edit")
+
+    if args.ontology_cmd == "sync":
+        return _sync_ontology(cfg, args.source)
+
+    if args.ontology_cmd == "apply":
+        return _apply_ontology(cfg, note="apply")
+
+    if args.ontology_cmd == "status":
+        st = ont.status(cfg)
+        if st["synced"]:
+            print(f"派生层是最新的(指纹 {st['digest']})。")
+            return 0
+        print(f"派生层不是最新的:{st['reason']}")
+        for rel in st["changed"][:12]:
+            print(f"  待更新  {rel}")
+        for rel in st["missing"][:12]:
+            print(f"  缺失    {rel}")
+        for rel in st["hand_edited"][:12]:
+            print(f"  被手改  {rel}")
+        print("跑:dots ontology apply")
+        return 1
+    return 2
+
+
+def _apply_ontology(cfg, *, note: str = "") -> int:
+    from dots import ontology as ont
+    from dots import sdlc as sdlc_mod
+
+    doc = ont.load(cfg)
+    problems = ont.validate(doc)
+    if problems:
+        print("本体库校验不过,没有生成任何东西:", file=sys.stderr)
+        for x in problems:
+            print(f"  - {x}", file=sys.stderr)
+        return 1
+    res = ont.apply(cfg, doc)
+    docs = sdlc_mod.sync_docs(cfg, doc)
+    print(f"派生文件 {len(res['files'])} 个:新写/更新 {len(res['written'])},"
+          f"删掉 {len(res['removed'])}。指纹 {res['digest']}")
+    for rel in res["written"][:10]:
+        print(f"  + {rel}")
+    print(f"流水线文档同步:{docs['pipelines']} 条流水线,改了 {len(docs['changed'])} 个文件")
+    for rel in docs["changed"][:10]:
+        print(f"  ~ {rel}")
+    print(f"根目录:{cfg.workspace / cfg.ontology.derived}")
+    return 0
+
+
+def _sync_ontology(cfg, source: str | None) -> int:
+    from dots import ontology as ont
+    from dots import sdlc as sdlc_mod
+
+    if not cfg.ontology.datasources:
+        print("没配数据源。在 dot.toml 里加一段:", file=sys.stderr)
+        print("  [ontology.datasources.crm]\n  kind = \"postgres\"\n"
+              "  dsn_env = \"DOT_CRM_DSN\"", file=sys.stderr)
+        return 2
+    names = [source] if source else list(cfg.ontology.datasources)
+    doc = ont.load(cfg)
+    failed = 0
+    for name in names:
+        ds = cfg.ontology.datasources.get(name)
+        if ds is None:
+            print(f"没有叫 {name!r} 的数据源。可用的:{', '.join(cfg.ontology.datasources)}",
+                  file=sys.stderr)
+            failed += 1
+            continue
+        try:
+            raws = ont.introspect(ds)
+        except Exception as e:                      # noqa: BLE001 - 一个库连不上不该中断全部
+            print(f"{name} 采集失败:{type(e).__name__}: {e}", file=sys.stderr)
+            failed += 1
+            continue
+        stats = ont.merge(doc, name, raws, ds=ds)
+        print(f"{name}({ds.kind}):表/集合 {len(raws)},新增实体 {len(stats['added'])},"
+              f"更新 {len(stats['updated'])},库里已无 {len(stats['missing'])}")
+        for line in stats["conflicts"][:5]:
+            print(f"  ! {line}")
+    if not doc.get("entities"):
+        print("一个实体都没采到(检查 schema / include / exclude)。", file=sys.stderr)
+        return 1
+    ont.save(cfg, doc, note=f"sync:{','.join(names)}")
+    res = ont.apply(cfg, doc)
+    docs = sdlc_mod.sync_docs(cfg, doc)
+    print(f"本体库:{len(doc['entities'])} 个实体,指纹 {res['digest']}")
+    print(f"派生文件更新 {len(res['written'])} 个;流水线文档改了 {len(docs['changed'])} 个")
+    print("下一步:dots ontology status / dots sdlc sync")
+    return 1 if failed else 0
+
+
+def _cmd_sdlc(args, cfg, conn) -> int:
+    from dots import sdlc as sdlc_mod
+
+    if not cfg.sdlc.enabled:
+        print("流水线被关掉了([sdlc] enabled = false)。", file=sys.stderr)
+        return 2
+
+    if args.sdlc_cmd == "new":
+        text = " ".join(args.text).strip()
+        external = {"jira": args.jira} if args.jira else {}
+        p = sdlc_mod.create(cfg, conn, text, title=args.title,
+                            track=args.track, external=external)
+        print(f"{p['id']}  {p['title']}")
+        print(f"目录:{cfg.sdlc.dir}/{p['slug']}  轨迹:{p['track']}  首阶段:{p['stage']}")
+        print("跑起来:python -m dots serve(或 python -m dots tick)")
+        return 0
+
+    if args.sdlc_cmd == "ls":
+        rows = [p for p in sdlc_mod.list_pipelines(cfg)]
+        if not rows:
+            print('还没有流水线。开一条:dots sdlc new "把订单导出成 CSV"')
+            return 0
+        print(_table(
+            [(p.get("id"), p.get("status"), p.get("track"), p.get("stage"),
+              str(p.get("title"))[:40], (p.get("updated_at") or "")[:16])
+             for p in rows],
+            ("ID", "STATUS", "TRACK", "STAGE", "TITLE", "UPDATED"),
+        ))
+        return 0
+
+    if args.sdlc_cmd == "show":
+        p = sdlc_mod.load(cfg, args.id)
+        if p is None:
+            print(f"没有 {args.id!r} 这条流水线。dots sdlc ls 看看。", file=sys.stderr)
+            return 1
+        print(f"{p['id']}  {p['title']}  [{p['track']}/{p['status']}]")
+        print(f"目录:{cfg.sdlc.dir}/{p['slug']}  当前阶段:{p['stage']}")
+        print(f"Jira:{p.get('external', {}).get('jira') or '-'}"
+              f"  修复轮次:{p['rounds'].get('fix', 0)}/{cfg.sdlc.max_fix_rounds}")
+        rows = []
+        for stage in sdlc_mod.TRACKS.get(p["track"], []):
+            rec = p["stages"].get(stage) or {}
+            miss = sdlc_mod.missing_artifacts(cfg, p, stage) if stage == p["stage"] else []
+            rows.append((
+                stage, sdlc_mod.STAGES[stage]["title"], rec.get("status") or "pending",
+                rec.get("goal_id") or "-", str(rec.get("attempts") or 0),
+                "; ".join(miss)[:40],
+            ))
+        print(_table(rows, ("STAGE", "名称", "状态", "GOAL", "次", "缺什么")))
+        hist = (p.get("history") or [])[-6:]
+        if hist:
+            print("\n最近:")
+            for h in hist:
+                print(f"  {h.get('at', '')[:16]}  {h.get('event')}  "
+                      f"{h.get('stage', '')} {h.get('next', '')}")
+        return 0
+
+    if args.sdlc_cmd == "sync":
+        return _apply_ontology(cfg, note="sdlc-sync")
+
+    if args.sdlc_cmd == "advance":
+        p = sdlc_mod.load(cfg, args.id)
+        if p is None:
+            print(f"没有 {args.id!r} 这条流水线。", file=sys.stderr)
+            return 1
+        print(sdlc_mod.advance_manual(cfg, conn, p, note=args.note))
+        return 0
+    return 2
+
+
+def _cmd_bugs(args, cfg, conn) -> int:
+    from dots import bugs as bugs_mod
+    from dots import sdlc as sdlc_mod
+
+    cmd = getattr(args, "bugs_cmd", None) or "ls"
+
+    if cmd == "ls":
+        rows = db.list_bugs(conn, getattr(args, "status", None), limit=50)
+        if not rows:
+            print("台账是空的。微信群报了 BUG 会自动进来;也可以 dots wechat ingest 试一条。")
+            return 0
+        print(_table(
+            [(r["id"], r["severity"], r["status"], r["count"],
+              (r["channel"] + ("/" + r["group_name"] if r["group_name"] else "")),
+              _ago(r["last_seen"]), r["title"][:40])
+             for r in rows],
+            ("ID", "SEV", "STATUS", "N", "来源", "LAST", "TITLE"),
+        ))
+        open_n = len(db.open_bugs(conn, limit=500))
+        print(f"\n{len(rows)} 条;还没修完 {open_n} 条。"
+              f" 看详情:dots bugs show <id>   开流水线:dots bugs fix <id>")
+        return 0
+
+    if cmd == "show":
+        row = db.get_bug(conn, args.id)
+        if row is None:
+            print(f"没有 {args.id!r} 这条缺陷。", file=sys.stderr)
+            return 1
+        print(json.dumps(dict(row), ensure_ascii=False, indent=2, default=str))
+        return 0
+
+    if cmd == "close":
+        row = db.get_bug(conn, args.id)
+        if row is None:
+            print(f"没有 {args.id!r} 这条缺陷。", file=sys.stderr)
+            return 1
+        db.set_bug(conn, args.id, status=db.BUG_CLOSED)
+        db.audit(conn, row["goal_id"], "bug_closed", args.id)
+        print(f"{args.id} 已关闭。")
+        return 0
+
+    if cmd == "fix":
+        rows, missing = [], []
+        for bid in args.ids:
+            row = db.get_bug(conn, bid)
+            (rows if row else missing).append(row or bid)
+        if missing:
+            print(f"不存在的缺陷:{', '.join(map(str, missing))}", file=sys.stderr)
+        if not rows:
+            return 1
+        if not cfg.sdlc.enabled:
+            print("流水线关了,没法自动修。打开 [sdlc] enabled 再试。", file=sys.stderr)
+            return 2
+        title = args.title or f"[BUG] {rows[0]['title']}"
+        p = sdlc_mod.create(
+            cfg, conn, bugs_mod.requirement_text(rows), title=title,
+            track="bugfix", bug_ids=[r["id"] for r in rows],
+        )
+        for row in rows:
+            db.set_bug(conn, row["id"], status=db.BUG_FIXING, pipeline_id=p["id"])
+        print(f"{p['id']}  {p['title']}")
+        print(f"修 {len(rows)} 条缺陷,目录 {cfg.sdlc.dir}/{p['slug']}。跑起来:dots serve")
+        return 0
+    return 2
+
+
+def _cmd_wechat(args, cfg) -> int:
+    from dots import wechat as wechat_mod
+
+    if args.wechat_cmd == "ingest":
+        text = " ".join(args.text).strip()
+        p = wechat_mod.append(cfg, group=args.group, sender=args.sender or "cli", text=text)
+        print(f"写进 {p}")
+        print("下一轮 tick 会读它;先看会不会被认成 BUG:dots bugs")
+        return 0
+
+    if args.wechat_cmd == "hook":
+        wechat_mod.serve_forever(cfg, port=args.port)
+        return 0
+
+    if args.wechat_cmd == "status":
+        sub = cfg.sources.wechat
+        p = wechat_mod.spool_path(cfg)
+        size = p.stat().st_size if p.exists() else 0
+        print(f"源:      {'开' if sub.enabled else '关'}([sources.wechat] enabled)")
+        print(f"spool:   {p}({size} 字节)")
+        print(f"读到:    {db_cursor(cfg)}")
+        print(f"分组:    {', '.join(sub.groups) if sub.groups else '全部'}")
+        print(f"关键词:  {', '.join(sub.keywords) if sub.keywords else '内置默认'}")
+        print(f"webhook: python -m dots wechat hook --port 8790")
+        return 0
+    return 2
+
+
+def db_cursor(cfg) -> str:
+    """wechat 源的游标。单独开一条只读连接 —— 这条命令不该抢主连接。"""
+    try:
+        conn = db.connect(cfg.db)
+    except Exception:
+        return "(读不到库)"
+    try:
+        return db.cursor_get(conn, "wechat") or "0(还没读过)"
+    finally:
+        conn.close()
+
+
 def _cmd_doctor(args) -> int:
     """一条一条查,每条都给出能照做的下一步。"""
     ok_all = True
@@ -556,7 +1021,8 @@ def _cmd_doctor(args) -> int:
         conn = None
 
     enabled = [n for n, s in (("fs", cfg.sources.fs), ("imap", cfg.sources.imap),
-                              ("ical", cfg.sources.ical)) if s.enabled]
+                              ("ical", cfg.sources.ical), ("wechat", cfg.sources.wechat))
+               if s.enabled]
     check("事件源", bool(enabled),
           ", ".join(enabled) if enabled else "一个都没开",
           "至少要开一个,否则没有东西能主动唤醒它")
@@ -577,6 +1043,51 @@ def _cmd_doctor(args) -> int:
         check("成本上限", True, f"{cfg.daily_token_budget:,} token/天")
     else:
         print("  ! 成本上限  没设 —— 先跑一天再用 dots cost 看真实数字")
+
+    if cfg.ontology.enabled:
+        from dots import ontology as ont
+        doc = ont.load(cfg)
+        st = ont.status(cfg, doc)
+        n = len(doc.get("entities") or [])
+        check(
+            "本体库", True,
+            f"{n} 个实体 · {len(cfg.ontology.datasources)} 个数据源 · "
+            + ("派生层最新" if st["synced"] else f"派生层待更新({st['reason']})"),
+        )
+        if not st["synced"]:
+            print("      -> dots ontology apply")
+        if cfg.ontology.datasources:
+            missing = [ds.dsn_env for ds in cfg.ontology.datasources.values()
+                       if ds.dsn_env and not os.environ.get(ds.dsn_env)]
+            if missing:
+                print("  ! 数据源凭据  缺环境变量:" + ", ".join(missing))
+    else:
+        print("  ! 本体库  已关闭([ontology] enabled = false)")
+
+    if cfg.mcp.enabled or cfg.mcp.servers:
+        from dots import mcp as mcp_mod
+        ok, detail = mcp_mod.check(cfg)
+        check("MCP", ok, detail,
+              "dots mcp add jira|feishu|gitlab|sigma;缺依赖 pip install 'dots-agent[mcp]'")
+    else:
+        print("  ! MCP  没接外部系统(飞书/Jira/Sigma/GitLab)")
+
+    if cfg.sdlc.enabled:
+        from dots import sdlc as sdlc_mod
+        pipelines = sdlc_mod.list_pipelines(cfg)
+        active = [p for p in pipelines if p.get("status") == "active"]
+        check("流水线", True, f"{len(pipelines)} 条,进行中 {len(active)} 条")
+    else:
+        print("  ! 流水线  已关闭([sdlc] enabled = false)")
+
+    if cfg.sources.wechat.enabled:
+        from dots import wechat as wechat_mod
+        p = wechat_mod.spool_path(cfg)
+        if p.exists():
+            check("微信群 spool", True, f"{p}({p.stat().st_size} 字节)")
+        else:
+            check("微信群 spool", False, f"{p} 还不存在",
+                  "跑一次 dots wechat status,或者让桥先写一条")
 
     print()
     if ok_all:
@@ -679,8 +1190,27 @@ def _cmd_selftest() -> int:
     print("== skills ==")
     skills_mod.demo()
 
+    from dots import bugs as bugs_mod
+    from dots import mcp as mcp_mod
+    from dots import ontology as ont_mod
+    from dots import sdlc as sdlc_mod
+    from dots import wechat as wechat_mod
+
+    print("== 本体库 ==")
+    ont_mod.demo()
+    print("== 缺陷指纹 ==")
+    bugs_mod.demo()
+    print("== 微信群 spool ==")
+    wechat_mod.demo()
+    print("== MCP ==")
+    mcp_mod.demo()
+    print("== 流水线 ==")
+    sdlc_mod.demo()
+
     try:
-        from tests import test_bridge, test_cli, test_loop, test_sources, test_web
+        from tests import (test_bridge, test_bugs, test_cli, test_loop, test_mcp,
+                           test_ontology, test_sdlc, test_sources, test_wechat,
+                           test_web)
     except ImportError:
         print("\n内置自检通过。")
         print("完整套件(本地假 IMAP 服务器 / 假模型跑 tick / 活动视图)在源码仓库里:")
@@ -692,6 +1222,15 @@ def _cmd_selftest() -> int:
     print(test_sources.run())
     print("== 一轮 tick(用假模型)==")
     print(test_loop.run())
+    print("== 本体库(采集/手改/派生)==")
+    print(test_ontology.run())
+    print("== 缺陷 + 微信群 ==")
+    print(test_bugs.run())
+    print(test_wechat.run())
+    print("== MCP 接入 ==")
+    print(test_mcp.run())
+    print("== 流水线 ==")
+    print(test_sdlc.run())
     print("== 桌面后端(bridge)==")
     print(test_bridge.run())
     print("== 活动视图 ==")

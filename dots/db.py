@@ -1,10 +1,12 @@
 """所有 SQL 都在这里。别的模块一个字都别写 SQL。
 
-四张表 + 一张 meta:
+五张表 + 一张 meta:
   goals      目标。没有它就没有「持续」——进程重启后靠它接着干。
   events     外部事件。UNIQUE(source, key) 就是幂等,重复扔同一个文件不会跑两次。
   approvals  挂起的动作。token 是主键,你回邮件时靠主题里的 token 对上号。
   audit      活动视图的唯一数据源,也是成本统计的唯一数据源。
+  bugs       缺陷台账。UNIQUE(fingerprint) 就是「同一个 bug 只开一个目标」,
+             微信群/邮件/CLI 报同一条错不会变成十个目标。
 """
 
 from __future__ import annotations
@@ -15,7 +17,7 @@ import sqlite3
 import time
 from datetime import datetime
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 DDL = """
 CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT NOT NULL);
@@ -68,10 +70,32 @@ CREATE TABLE IF NOT EXISTS audit (
     tokens      INTEGER NOT NULL DEFAULT 0
 );
 
+-- 缺陷台账。fingerprint 是「同一个 bug」的稳定指纹(见 dots/bugs.py),
+-- UNIQUE 就是去重:群里十个人报同一条错,只开一个目标、只算一次。
+CREATE TABLE IF NOT EXISTS bugs (
+    id          TEXT PRIMARY KEY,
+    fingerprint TEXT NOT NULL UNIQUE,
+    title       TEXT NOT NULL,
+    detail      TEXT NOT NULL DEFAULT '',
+    severity    TEXT NOT NULL DEFAULT 'P2',
+    channel     TEXT NOT NULL DEFAULT 'wechat',
+    group_name  TEXT,
+    reporter    TEXT,
+    status      TEXT NOT NULL DEFAULT 'open',
+    count       INTEGER NOT NULL DEFAULT 1,
+    first_seen  REAL NOT NULL,
+    last_seen   REAL NOT NULL,
+    goal_id     TEXT,
+    pipeline_id TEXT,
+    external_key TEXT,
+    samples     TEXT NOT NULL DEFAULT '[]'
+);
+
 CREATE INDEX IF NOT EXISTS idx_goals_status ON goals(status);
 CREATE INDEX IF NOT EXISTS idx_events_status ON events(status);
 CREATE INDEX IF NOT EXISTS idx_approvals_status ON approvals(status);
 CREATE INDEX IF NOT EXISTS idx_audit_goal ON audit(goal_id);
+CREATE INDEX IF NOT EXISTS idx_bugs_status ON bugs(status);
 """
 
 # 目标状态机
@@ -111,6 +135,9 @@ MIGRATIONS: dict[int, list[str]] = {
         "ALTER TABLE goals ADD COLUMN handoff_from TEXT",
         "ALTER TABLE goals ADD COLUMN handoff_note TEXT",
     ],
+    # v2 -> v3 只加了一张新表。新表由上面的 DDL(CREATE TABLE IF NOT EXISTS)建,
+    # 不需要 ALTER;这里留一条空迁移只为把版本号推上去,让老库也走一遍流程。
+    3: [],
 }
 
 
@@ -378,3 +405,88 @@ def tokens_since(conn, ts: float) -> int:
         "SELECT COALESCE(SUM(tokens), 0) AS n FROM audit WHERE ts >= ?", (ts,)
     ).fetchone()
     return int(row["n"])
+
+
+# ---------------------------------------------------------------------- bugs
+
+BUG_OPEN = "open"
+BUG_FIXING = "fixing"
+BUG_FIXED = "fixed"
+BUG_CLOSED = "closed"
+BUG_TERMINAL = (BUG_FIXED, BUG_CLOSED)
+
+
+def upsert_bug(conn, *, fingerprint: str, title: str, detail: str, severity: str,
+               channel: str = "wechat", group_name: str = "", reporter: str = "",
+               sample: str = "") -> tuple[str, bool, int]:
+    """按指纹记一条缺陷。返回 (bug id, 是否新建, 累计被报次数)。
+
+    重复报同一条错只 UPDATE:last_seen / count,不新建行 —— 去重是这张表的全部意义。
+    已经 closed 的又出现,状态退回 open:那是回归,不能安静地留在已关闭里。
+    """
+    row = conn.execute(
+        "SELECT * FROM bugs WHERE fingerprint = ?", (fingerprint,)
+    ).fetchone()
+    t = now()
+    if row is None:
+        bid = new_id()
+        conn.execute(
+            "INSERT INTO bugs(id, fingerprint, title, detail, severity, channel,"
+            " group_name, reporter, status, count, first_seen, last_seen, samples)"
+            " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (bid, fingerprint, title[:200], detail[:4000], severity, channel,
+             group_name[:100], reporter[:100], BUG_OPEN, 1, t, t,
+             json.dumps([sample] if sample else [], ensure_ascii=False)),
+        )
+        conn.commit()
+        return bid, True, 1
+
+    samples = json.loads(row["samples"] or "[]")
+    if sample and sample not in samples and len(samples) < 5:
+        samples.append(sample)
+    status = BUG_OPEN if row["status"] in BUG_TERMINAL else row["status"]
+    detail_new = row["detail"] if len(row["detail"] or "") >= len(detail) else detail[:4000]
+    conn.execute(
+        "UPDATE bugs SET count = count + 1, last_seen = ?, status = ?, detail = ?,"
+        " samples = ? WHERE id = ?",
+        (t, status, detail_new, json.dumps(samples, ensure_ascii=False), row["id"]),
+    )
+    conn.commit()
+    return row["id"], False, int(row["count"]) + 1
+
+
+def get_bug(conn, bid: str):
+    return conn.execute("SELECT * FROM bugs WHERE id = ?", (bid,)).fetchone()
+
+
+def find_bug_by_fingerprint(conn, fingerprint: str):
+    return conn.execute(
+        "SELECT * FROM bugs WHERE fingerprint = ?", (fingerprint,)
+    ).fetchone()
+
+
+def list_bugs(conn, status: str | None = None, limit: int = 50):
+    if status:
+        return conn.execute(
+            "SELECT * FROM bugs WHERE status = ? ORDER BY last_seen DESC LIMIT ?",
+            (status, limit),
+        ).fetchall()
+    return conn.execute(
+        "SELECT * FROM bugs ORDER BY last_seen DESC LIMIT ?", (limit,)
+    ).fetchall()
+
+
+def set_bug(conn, bid: str, **fields) -> None:
+    if not fields:
+        return
+    cols = ", ".join(f"{k} = ?" for k in fields)
+    conn.execute(f"UPDATE bugs SET {cols} WHERE id = ?", (*fields.values(), bid))
+    conn.commit()
+
+
+def open_bugs(conn, limit: int = 20):
+    """还没修完的。修完和关掉都不算。"""
+    return conn.execute(
+        "SELECT * FROM bugs WHERE status IN (?, ?) ORDER BY last_seen DESC LIMIT ?",
+        (BUG_OPEN, BUG_FIXING, limit),
+    ).fetchall()

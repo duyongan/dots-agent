@@ -23,6 +23,8 @@ from langchain_core.messages import HumanMessage
 from langgraph.types import Command
 
 from dots import approvals, db, graph, skills as skills_mod, sources
+from dots import bugs as bugs_mod
+from dots import sdlc as sdlc_mod
 
 
 # ------------------------------------------------------------------- 一轮 tick
@@ -42,6 +44,7 @@ def tick(cfg, conn, agents, *, dry_run: bool = False) -> dict:
         "events_new": 0, "approval_replies": 0, "goals_new": 0,
         "resumed": 0, "ran": 0, "interrupted": 0, "failed": 0,
         "handoffs": 0, "skipped": 0, "paused": None,
+        "bugs_new": 0, "bugs_repeat": 0, "sdlc": 0,
     }
     # tick 可以脱离 serve 单独跑(测试和 `dots tick` 都走这条路)
     graph.use_or_create(cfg, conn)
@@ -60,6 +63,12 @@ def tick(cfg, conn, agents, *, dry_run: bool = False) -> dict:
         ):
             _apply_reply(cfg, conn, payload, stats)
             db.consume_event(conn, row["id"], None, "approval")
+            continue
+
+        # 群消息要先去重、记台账,再决定开不开目标 —— 不能像文件那样一事件一目标,
+        # 否则群里十个人报同一条错就是十个目标烧十份 token。
+        if row["source"] == "wechat":
+            _route_wechat(cfg, conn, row, payload, stats)
             continue
 
         text = describe_event(row["source"], payload)
@@ -106,6 +115,51 @@ def tick(cfg, conn, agents, *, dry_run: bool = False) -> dict:
         _run(cfg, conn, agents, goal, dry_run=dry_run, stats=stats)
 
     return stats
+
+
+def _route_wechat(cfg, conn, row, payload: dict, stats: dict) -> None:
+    """一条群消息:认 BUG -> 记台账 -> 新建才起修复流水线。
+
+    去重是这里唯一的意义:同一个指纹第二次出现只加计数,不再开目标。
+    「已经修完又出现」算回归,会重新开一条修复流水线,不会安静地留在已修复里。
+    """
+    text = str(payload.get("text", ""))
+    group = str(payload.get("group", ""))
+    sender = str(payload.get("sender", ""))
+    keywords = cfg.sources.wechat.keywords or None
+
+    if not bugs_mod.should_report(text, keywords):
+        db.consume_event(conn, row["id"], None, "not_a_bug")
+        return
+
+    bug, fresh, count = bugs_mod.record(
+        conn, text, channel="wechat", group_name=group, reporter=sender,
+        keywords=keywords,
+    )
+    db.audit(conn, bug.get("goal_id"), "bug_report",
+             f"{bug['id']} {bug['severity']} x{count} {bug['title'][:80]}")
+    if not fresh:
+        stats["bugs_repeat"] += 1
+        db.consume_event(conn, row["id"], bug.get("goal_id"), "duplicate_bug")
+        return
+
+    stats["bugs_new"] += 1
+    if getattr(cfg, "sdlc", None) and cfg.sdlc.enabled and cfg.sdlc.auto_from_bug:
+        p = sdlc_mod.create(
+            cfg, conn, bugs_mod.requirement_text([bug]),
+            title=f"[BUG]{bug['title']}", track="bugfix", bug_ids=[bug["id"]],
+        )
+        db.set_bug(conn, bug["id"], pipeline_id=p["id"], status=db.BUG_FIXING)
+        db.consume_event(conn, row["id"], None, "bugfix_pipeline")
+        db.audit(conn, None, "bug_pipeline", f"{bug['id']} -> {p['id']}")
+        return
+
+    gid = db.add_goal(conn, bugs_mod.goal_text(bug), origin="event:wechat",
+                      status=db.READY)
+    db.set_bug(conn, bug["id"], goal_id=gid, status=db.BUG_FIXING)
+    db.consume_event(conn, row["id"], gid)
+    db.audit(conn, gid, "goal_from_event", f"wechat:{row['key']}")
+    stats["goals_new"] += 1
 
 
 def describe_event(source: str, payload: dict) -> str:
@@ -200,6 +254,16 @@ def _run(cfg, conn, agents, goal, *, dry_run: bool, stats: dict, resume=None,
             summary="这一轮结束了,但没有调用 complete_goal",
         )
         db.audit(conn, gid, "no_completion", "跑完了但没说完成")
+
+    # 流水线只认「真的完成且给了证据」的阶段目标。产物不全会重派一次,
+    # 两次不成就停下等人 —— 悄悄往前推比卡住更糟(见 sdlc.on_goal_done)。
+    if after["status"] == db.DONE:
+        note = sdlc_mod.on_goal_done(cfg, conn, after)
+        if note:
+            db.audit(conn, gid, "sdlc", note)
+            stats["sdlc"] += 1
+            print(f"[dot] 流水线:{note}")
+
     stats["ran"] += 1
     return "ran"
 
@@ -463,6 +527,7 @@ def summarize(stats: dict) -> str:
         ("events_new", "新事件"), ("approval_replies", "审批回复"), ("goals_new", "新目标"),
         ("resumed", "续跑"), ("ran", "跑完"), ("handoffs", "交接"),
         ("interrupted", "等审批"), ("failed", "失败"),
+        ("bugs_new", "新 BUG"), ("bugs_repeat", "重复报告"), ("sdlc", "流水线推进"),
     ):
         if stats.get(key):
             bits.append(f"{label} {stats[key]}")

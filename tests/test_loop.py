@@ -76,6 +76,9 @@ def _cfg(root: Path):
             imap=SimpleNamespace(enabled=False, host="", port=993, user="", folder="INBOX",
                                  password_env="X", interval=60, password=""),
             ical=SimpleNamespace(enabled=False, url="", interval=60),
+            wechat=SimpleNamespace(enabled=False, spool="wechat/inbox.jsonl", groups=[],
+                                   keywords=[], interval=60, max_batch=100,
+                                   token_env="X", token=""),
         ),
         # save_skill 要显式放行,否则 _gate 会去调 interrupt(),而这里没有图
         rules={"send_email": "ask", "run_shell": "deny", "save_skill": "allow"},

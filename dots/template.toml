@@ -57,6 +57,57 @@ enabled = false
 url = ""
 interval = 900
 
+[sources.wechat]
+# 微信群 BUG 监控。dots 不直接登录微信 —— 消息由桥(Wechaty / wechatferry /
+# 桌面 RPA)写进 spool,一行一条 JSON,这里只做增量读、关键词判定和去重。
+# 桥怎么接见 README 的「微信群监控」一节;换桥不用改 dots 一行代码。
+enabled = false
+spool = "wechat/inbox.jsonl"
+groups = []                  # 空 = 全部群;["项目A-线上问题"] = 只看这些群
+keywords = []                # 空 = 用内置的报错关键词
+interval = 60
+max_batch = 100              # 一次最多读多少条新消息
+# webhook 鉴权。token 放环境变量,留空 = 不校验(仍然只听 127.0.0.1)
+token_env = "DOT_WECHAT_TOKEN"
+
+[mcp]
+# 外部系统的 MCP server:飞书、Jira、Sigma、GitLab……
+# 密钥只写环境变量名。用 `dots mcp add feishu|jira|gitlab|sigma` 生成现成配置,
+# 或者照下面这段手写。工具名会带前缀(jira__create_issue),不会互相撞名。
+enabled = false
+
+# [mcp.servers.jira]
+# transport = "stdio"                        # stdio | sse | streamable_http
+# command = "uvx"
+# args = ["mcp-atlassian"]
+# pass_env = ["JIRA_URL", "JIRA_USERNAME", "JIRA_API_TOKEN", "JIRA_PROJECTS_FILTER"]
+# timeout = 60
+
+[ontology]
+# 本体库。从公司库采元数据 -> ontology/ontology.json(纯 JSON,可以手改)
+# -> 派生文档和代码到 generated/。改完 `dots ontology apply` 全流程一起变。
+enabled = true
+dir = "ontology"
+derived = "generated"
+inject_prompt = true          # 每轮把实体摘要塞进系统提示
+prompt_entities = 40
+
+# [ontology.datasources.crm]
+# kind = "postgres"           # postgres | mysql | mongodb
+# dsn_env = "DOT_CRM_DSN"     # 连接串放环境变量,别写进这个文件
+# schema = "public"
+# include = []                # 只看这些表/集合,支持通配
+# exclude = ["alembic_*", "tmp_*", "sys_*"]
+# sample_size = 50
+
+[sdlc]
+# 需求分析 → 原型设计 → 开发 → 测试 → 修复。一条流水线一个子目录,
+# 阶段推进、产物、轮次都在 workspace/projects/<id>/pipeline.json 里。
+enabled = true
+dir = "projects"
+max_fix_rounds = 3            # 测试不过 → 修复 → 再测,最多来回几次
+auto_from_bug = true          # 微信群报的 BUG 自动起一条修复流水线
+
 [approval]
 subject_prefix = "[dot#"
 # 挂起的动作超过这么多小时没人批,自动按「拒绝」处理。0 = 永远等。

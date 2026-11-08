@@ -7,6 +7,12 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 常驻主动式 agent:进程在后台反复 tick,自己从事件源发现问题、建目标、跑目标,产出落在工作区。
 包名 `dots-agent`,命令 `dots`。Python ≥3.11,依赖 deepagents / langgraph(SQLite checkpointer)/ langchain。
 
+2.0 起它还是**一条研发流水线**:需求分析 → 原型设计 → 开发 → 测试 → 修复 → 归档,
+产物落到 `workspace/projects/<slug>/`(PRD / design / dev / test / fix / archive),
+靠一份可手改的**本体库**(`workspace/ontology/ontology.json`)对齐全流程的实体和字段名,
+并把飞书 / Jira / Sigma / GitLab 当 MCP server 挂成工具;微信群里的报错会被去重成缺陷台账,
+必要时自动开一条修复流水线。
+
 代码注释、docstring、面向用户的输出一律中文;给模型看的提示词(`SYSTEM_PROMPT` / bot prompt)是英文,
 `CHAT_PROMPT`、`LEARN_PROMPT`、`CURATE_PROMPT` 是中文。
 
@@ -19,11 +25,18 @@ python -m pytest tests/ -q                 # 全套(约 30s)
 python -m pytest tests/test_loop.py -q     # 只跑一个文件
 python -m pytest tests/test_sources.py::test_imap_poll_over_tls -q   # 只跑一个用例
 python -m tests.test_loop                   # 直接跑,打印每个用例的一句话结论
-python -m dots selftest                     # 不联网不调模型:跑四个 demo() + 全套 tests(5 节)
+python -m dots selftest                     # 不联网不调模型:9 个 demo() + 全套 tests
 
-python -m dots doctor                       # 体检(配置/密钥/模型/目录/DB/事件源)
+python -m dots doctor                       # 体检(配置/密钥/模型/目录/DB/事件源/本体/MCP/流水线)
 python -m dots tick                         # 手动跑一轮就退
 python -m dots serve --web                  # 常驻 + 活动视图 http://127.0.0.1:8765/
+
+python -m dots sdlc new "需求一句话" --jira OPS-1   # 开一条流水线(默认 feature)
+python -m dots sdlc ls / show <id> / sync / advance <id>
+python -m dots ontology init / sync [数据源] / show [实体] / edit / apply / status
+python -m dots mcp list / add jira|feishu|gitlab|sigma
+python -m dots bugs [ls|show|close|fix]
+python -m dots wechat ingest|hook|status
 ```
 
 pytest 会报一批 `PytestReturnNotNoneWarning`,这是**预期的**:每个用例 return 一句中文结论,
@@ -39,9 +52,9 @@ pyproject 动态读它;提交信息格式是 `<版本>:<一句话改动>`。
 `worker.tick()` 四步,顺序不能换:
 
 1. `sources.poll_all()` 收事件,`db.add_event` 落库(`UNIQUE(source, key)` 就是幂等)
-2. 路由新事件:审批回信 → 写决定;其它 → 建 ready 目标
+2. 路由新事件:审批回信 → 写决定;微信群消息 → 缺陷台账(去重);其它 → 建 ready 目标
 3. 已决定的审批 → 续跑对应目标(先让超时的审批按拒绝过期)
-4. 挑一个 ready 目标跑一轮
+4. 挑一个 ready 目标跑一轮;跑完且带证据的流水线目标会推进阶段
 
 CLI 和 sources **都不许直接调 graph**,一律经 worker。`worker.serve()` 是外层循环,
 每轮 `recover_stale_runs()` 把被 kill 后卡在 running 的目标放回 ready(checkpoint 还在,接着跑不是重跑)。
@@ -72,13 +85,16 @@ CLI 和 sources **都不许直接调 graph**,一律经 worker。`worker.serve()`
 
 ### 数据库(db.py 是唯一写 SQL 的地方)
 
-四张表 + meta:`goals` / `events` / `approvals` / `audit`。`audit` 既是活动视图数据源也是成本统计源。
+五张表 + meta:`goals` / `events` / `approvals` / `audit` / `bugs`。`audit` 既是活动视图数据源也是成本统计源。
 
 - 目标状态机:`pending`(agent 派生,要人工批)→ `ready` → `running` → `interrupted` / `pending_review` / `done` / `failed`
 - 抢目标靠 `claim_goal()` 的 `WHERE status = ?`,rowcount=0 就是没抢到,不需要额外的锁
+- `bugs` 靠 `UNIQUE(fingerprint)` 去重:同一个根因只开一个目标,重复报只加 `count`。
+  已经 `fixed/closed` 的又出现,`upsert_bug` 会把状态退回 `open`(回归),调用方据此重开流水线
 - checkpointer、web、每请求各开**自己的一条 sqlite 连接**。跟应用库共用会互相 commit 掉对方的事务
   (`cannot commit - no transaction is active`)。Windows 上连接不关就删不掉 db 文件
 - 加字段:DDL 是 `CREATE TABLE IF NOT EXISTS`,对老库无效 —— 必须往 `MIGRATIONS` 里加对应的 ALTER 并抬 `SCHEMA_VERSION`
+  (v3 只加了 `bugs` 表,所以迁移是空的:新表由 DDL 建)
 
 ### 自激循环(最容易踩的坑)
 
@@ -103,6 +119,56 @@ agent 往被监听的目录写的东西会被自己的 fs 源当成下一轮新�
 description 每轮都进系统提示并**被截断在 60 字符**,所以校验卡得很死;
 提示词里写一遍是提醒,真正拦人的是 `skills.validate()`。
 
+### 全流程流水线(sdlc.py)
+
+阶段定义在 `STAGES`(artifacts + 每份文档必须包含的小节),轨迹在 `TRACKS`:
+`feature` = 需求→原型→开发→测试→(fix)→归档,`bugfix` = 修复→测试→归档。
+
+- 一条流水线 = `workspace/projects/<slug>/pipeline.json` + 各阶段产物目录。
+  状态在 JSON 里,不在数据库里 —— 人可以看、可以改、可以 `dots sdlc advance` 人工跳过。
+- **阶段目标是 worker 自动派发的**,不是用户建的。目标文本前缀 `【SDLC <pid> <stage> n/m】`,
+  `sdlc.parse_marker()` 解析它;`goal_text()` 把需求、前序产物、本体摘要、MCP 提示、验收门槛全写进去。
+- 推进钩子在 `worker._run()` 里:目标 `done`(有 evidence)之后调 `sdlc.on_goal_done()`。
+  它先 `missing_artifacts()` 查产物和小节,**缺了就重派一次,两次缺就 blocked** —— 绝不悄悄往前推。
+- 测试阶段看 `test/report.md` 的 `VERDICT: PASS|FAIL`;FAIL 进 fix,fix 完再测,
+  超过 `[sdlc] max_fix_rounds` 就 blocked。
+- 阶段 bot(`pm/designer/dev/qa/fixer`)由 `config.load()` 保证一定存在 ——
+  目标行里写着 bot 名,`build_agents` 少一张图那一轮就直接跑不起来。
+- `sync_docs()` 重写每条流水线每份 md 里的 `<!-- ontology:begin/end -->` 段,可重复执行。
+
+### 本体库(ontology.py)
+
+三层,别混:
+
+- 物理层:公司库的表/字段。`introspect()` 只读,驱动懒加载(psycopg / pymysql / pymongo),
+  没装驱动只在 `dots ontology sync` 时报错,不影响 import。
+- 语义层:`ontology/ontology.json`。**人工优先**:`curated: true` 的实体/字段在下次 merge 时
+  只刷新物理类型,标注/枚举/关系不动;库里新增的列只报 `conflicts`,不静默合并;
+  库里消失的表标 `missing`,不删。`digest()` 排除 `updated_at/digest` 自身,否则指纹每次都变。
+- 派生层:`generated/` 下的数据字典、DDL、Python/TS 模型、ER 图,`manifest.json` 记每份文件的 sha1。
+  `status()` 用指纹 + 文件哈希判断过期/被手改。
+
+`save()` 前必过 `validate()` 并留一份 `history/` 快照;`apply()` 会删掉「上次有、这次没有」
+的派生文件(实体被删的情况)。手改之后派生层不自动跟,必须 `apply` —— 这是有意的,
+不然编辑器每存一次盘就可能触发一整轮重写。
+
+### MCP(mcp.py)
+
+- 配置在 `[mcp.servers.<名>]`,密钥只走环境变量;`args/url/env` 里的 `${VAR}` 在连接时才展开。
+- 工具名统一前缀 `<server>__<tool>`。`gated()` 再套一层 `_gate()`,所以审批规则能按系统写通配。
+- `langchain-mcp-adapters` 是可选依赖:没装只返回一句说明,`load_tools()` 绝不抛。
+- 连接很贵(npx/uvx 子进程),按连接参数缓存;一个 server 连不上不能拖垮其它 server,也不能拖垮 tick。
+
+### 微信群 + 缺陷(bugs.py + wechat.py)
+
+- dots **不登录微信**。桥往 `workspace/wechat/inbox.jsonl` 追加 JSONL,`wechat.read_new()`
+  按字节偏移读增量,半行留到下次(桥写一半时不能吃掉)。轮转(文件变短)就从头读,事件表 UNIQUE 兜重复。
+- 判定和去重不在源里:`sources.wechat_poll()` 只按分组/关键词过滤,`worker._route_wechat()`
+  才做 `bugs.record()` -> 台账 -> 决定开不开目标/流水线。
+- 指纹优先用「异常类型 + 顶部文件名」,其次错误码,最后归一化正文。
+  **不要加入行号** —— 行号随代码漂移,拿它当指纹等于每次都新报一条。
+- webhook 只听 127.0.0.1,`token_env` 为空时不校验;别改成对外 host。
+
 ### 配置(config.py 是唯一读 dot.toml 的地方)
 
 查找顺序:`-c` 指定 → `./dot.toml` → `~/.dots/dot.toml`。**`-c` 指了就不兜底**,打错字直接报错。
@@ -125,8 +191,9 @@ description 每轮都进系统提示并**被截断在 60 字符**,所以校验�
 
 - 注释里出现 `ponytail:` 是**作者标记的有意为之的将就**(已知限制 + 何时该替换)。
   看到它不要当 bug 修,除非确实到了它写明的替换条件
-- `rules.py` / `sources.py` / `approvals.py` / `skills.py` 各有一个 `demo()`,
-  纯逻辑零依赖,`dots selftest` 会调。改这几个模块的纯逻辑时顺手更新 demo 里的断言
+- `rules.py` / `sources.py` / `approvals.py` / `skills.py` / `bugs.py` / `wechat.py` /
+  `ontology.py` / `sdlc.py` / `mcp.py` 各有一个 `demo()`,纯逻辑零依赖,`dots selftest` 会调。
+  改这几个模块的纯逻辑时顺手更新 demo 里的断言
 - CLI 只有一份命令表(`cli._parser()`),交互终端把 `/xxx` 原样再喂给 `main()`,
   所以交互里能用的和命令行完全一样。加命令只改 `_parser()` 和 `_dispatch()`
 - `cli._table()` 用 `_w()` 算东亚字符宽度(中文占两格),表格对齐靠它,别用 `len()`

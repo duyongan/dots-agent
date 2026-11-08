@@ -4,6 +4,15 @@
 
 包名 `dots-agent`,命令是 `dots`(装完就有)。两种用法:**命令行**,或者 **Windows 桌面窗口**。
 
+2.0 起它不止会接活,还能把一条需求从头送到尾:
+
+- **全流程流水线**:需求分析 → 原型设计 → 开发 → 测试 → 修复 → 归档,阶段推进看产物不看嘴。
+  见 [全流程流水线](#全流程流水线需求原型开发测试修复)。
+- **本体库**:从公司库(PG / MySQL / Mongo)采元数据,存成一份可以手改的 JSON,
+  再派生文档和代码;改完一条命令,全流程的文档和代码一起变。见 [本体库](#本体库)。
+- **MCP**:飞书、Jira、Sigma、GitLab 的工具直接挂到手上,走同一套审批闸门。见 [MCP](#mcp飞书--jira--sigma--gitlab)。
+- **微信群 BUG 监控**:群里的报错自动去重、进台账、开修复流水线。见 [微信群 BUG 监控](#微信群-bug-监控)。
+
 ## 安装
 
 ### 命令行
@@ -468,6 +477,24 @@ dots gui
 | `dots skill show <名>` | 看技能正文 |
 | `dots skill rm <名>` | 删掉技能 |
 | `dots curate` | 让 agent 整理技能库:合并重复、删掉没价值的 |
+| `dots mcp list` | 看接了哪些外部系统、缺哪个环境变量 |
+| `dots mcp add jira\|feishu\|gitlab\|sigma` | 把一家现成的 MCP 配置写进 `dot.toml` |
+| `dots ontology init` | 建一份空的 `ontology/ontology.json` |
+| `dots ontology sync [数据源]` | 从公司库采元数据,合并进本体库,再派生文档和代码 |
+| `dots ontology show [实体]` | 看实体列表,或某个实体的完整定义 |
+| `dots ontology edit` | 用编辑器手改本体库,存盘后自动校验并重新派生 |
+| `dots ontology apply` | 按当前本体库重新生成派生文档和代码 |
+| `dots ontology status` | 派生层是不是落后于本体库 |
+| `dots sdlc new "..."` | 开一条流水线。`--track bugfix` 走缺陷轨迹,`--jira` 绑单号 |
+| `dots sdlc ls` / `dots sdlc show <id>` | 列流水线 / 看某条的阶段、产物、历史 |
+| `dots sdlc sync` | 把本体库变更同步进所有流水线文档 |
+| `dots sdlc advance <id>` | 人工跳过当前阶段(卡住时用,会留痕) |
+| `dots bugs` | 缺陷台账(微信群报的 BUG 都在这儿) |
+| `dots bugs fix <id>...` | 给一条或多条缺陷开修复流水线 |
+| `dots bugs close <id>` | 关掉一条缺陷 |
+| `dots wechat ingest "..."` | 手动灌一条群消息(补录 / 联调) |
+| `dots wechat hook --port 8790` | 起本机 webhook,接收桥推来的消息 |
+| `dots wechat status` | spool 在哪、读到哪了 |
 | `dots selftest` | 不联网不调模型跑一遍自检 |
 
 找配置的顺序:**`-c` 指定的路径 → 当前目录的 `./dot.toml` → `~/.dots/dot.toml`**。
@@ -606,15 +633,78 @@ max_hops = 3             # 一个目标最多被交接几次,防乒乓
 daily_token_budget = 0   # 0 = 不限。填了数字,超了当天就不再跑新目标
 ```
 
+### `[sources.wechat]` 微信群监控
+
+```toml
+[sources.wechat]
+enabled = false
+spool = "wechat/inbox.jsonl"   # 桥往这里 append,一行一条 JSON
+groups = []                    # 空 = 全部群;["项目A-线上问题"] = 只看这些群
+keywords = []                  # 空 = 内置的报错关键词
+interval = 60
+max_batch = 100                # 一次最多读多少条新消息
+token_env = "DOT_WECHAT_TOKEN" # webhook 鉴权;留空 = 不校验(仍然只听 127.0.0.1)
+```
+
+### `[mcp]` 外部系统
+
+```toml
+[mcp]
+enabled = false
+
+[mcp.servers.jira]
+transport = "stdio"                     # stdio | sse | streamable_http
+command = "uvx"
+args = ["mcp-atlassian"]
+pass_env = ["JIRA_URL", "JIRA_USERNAME", "JIRA_API_TOKEN"]
+env = { JIRA_PROJECTS_FILTER = "OPS" }  # 固定值写这里,密钥走 pass_env
+timeout = 60
+prefix = "jira"                         # 工具名前缀,默认就是 server 名
+```
+
+`dots mcp add jira` 会直接生成这样一段。参数和 URL 里可以写 `${VAR}`,
+连接时才展开 —— 所以像飞书那种必须把 app_secret 放命令行的服务,
+dot.toml 里也只留变量名。
+
+### `[ontology]` 本体库
+
+```toml
+[ontology]
+enabled = true
+dir = "ontology"          # ontology.json + history/
+derived = "generated"     # 派生产物,整体可重建,别手改
+inject_prompt = true      # 每轮把实体摘要塞进系统提示
+prompt_entities = 40      # 摘要里最多列多少个实体
+
+[ontology.datasources.crm]
+kind = "postgres"         # postgres | mysql | mongodb
+dsn_env = "DOT_CRM_DSN"   # 连接串放环境变量
+schema = "public"         # MySQL 用 database 当 schema
+include = []              # 只看这些表/集合,支持通配
+exclude = ["alembic_*", "tmp_*", "sys_*"]
+sample_size = 50          # mongo 采样条数
+```
+
+### `[sdlc]` 流水线
+
+```toml
+[sdlc]
+enabled = true
+dir = "projects"          # 一条流水线一个子目录
+max_fix_rounds = 3        # 测试 FAIL → 修复 → 再测,最多来回几次
+auto_from_bug = true      # 微信群报的 BUG 自动起修复流水线
+```
+
 ## 后台一轮 tick 做了什么
 
 每轮固定四步:
 
-1. **收事件**:`sources.poll_all()` 扫描事件源(工作区文件、IMAP 邮件、iCalendar),
+1. **收事件**:`sources.poll_all()` 扫描事件源(工作区文件、IMAP 邮件、iCalendar、微信群 spool),
    新事件落 `events` 表。`UNIQUE(source, key)` 保证同一件事只收一次。
-2. **路由事件**:主题带 `[dot#` 的审批回信写进 `approvals` 表;其它事件建成 ready 目标。
+2. **路由事件**:主题带 `[dot#` 的审批回信写进 `approvals` 表;群消息先过 BUG 判定和台账去重;
+   其它事件建成 ready 目标。
 3. **处理已决定的审批**:超时的按拒绝过期,已批准/拒绝的续跑对应目标。
-4. **跑一个 ready 目标**。
+4. **跑一个 ready 目标**。目标完成且给了证据后,如果它属于某条流水线,就推进阶段并派下一段。
 
 然后睡 `tick_seconds` 秒,再下一轮。停止请求能在睡眠中被打断,不用等满一分钟。
 
@@ -627,6 +717,191 @@ daily_token_budget = 0   # 0 = 不限。填了数字,超了当天就不再跑新
 - agent 往被监听目录写的东西会被自己的文件源当成新事件。后端会把本轮新增文件预插成
   `status='self'` 挡掉,否则它会对着自己的产出无限套娃。
 
+## 全流程流水线(需求→原型→开发→测试→修复)
+
+一条需求进来,分阶段跑完,每个阶段只干自己那段,产物落盘给下一段读:
+
+```text
+需求分析(pm) → 原型设计(designer) → 开发(dev) → 测试(qa) → 修复(fixer) → 归档(pm)
+```
+
+```bash
+dots sdlc new "把订单导出成 CSV,只要已支付的" --jira OPS-42
+dots sdlc ls
+dots sdlc show <id>
+dots serve                 # 后台每轮推进一步
+```
+
+目录长这样(相对 `workspace/`):
+
+```text
+projects/<slug>/
+├── pipeline.json          状态机:阶段、轮次、目标 id、历史。人可以改
+├── PRD/requirements.md    需求:背景 / 用户故事 / 验收标准 / 非目标 / 待确认问题
+├── PRD/questions.md       澄清问题清单,每题带 2-4 个选项
+├── design/prototype.md    原型说明:页面 / 交互 / 状态
+├── design/prototype.html  能点的静态原型
+├── dev/spec.md            技术方案 + 任务拆分
+├── dev/tasks/T01-*.md     一个任务一个文件 = 一次做完并自测的最小单元
+├── dev/src/               代码
+├── test/report.md         测试报告,最后一个非空行必须是 VERDICT: PASS 或 FAIL
+├── fix/fix-log.md         缺陷 / 根因 / 改动 / 回归
+└── archive/summary.md     功能点 / 怎么跑 / 已知限制,给以后排查
+```
+
+**推进靠产物,不靠模型说自己做完了**:
+
+- 每阶段有必须落盘的文件和必须包含的小节。缺了就不推进,重派一次;
+  两次还缺就停下并记 audit —— 悄悄往前推比卡住更糟。
+- `VERDICT: FAIL` 会进修复阶段,修完再测,`max_fix_rounds` 轮还不收敛就停。
+- 目标完成时 `evidence` 里的路径和 Jira/MR 单号会留在 `pipeline.json` 里,
+  下一个阶段不用猜上一段干了什么。
+- 阶段目标由 worker 自动派发,进程重启、断点续跑都不会把流水线卡在半路。
+  实在卡住了:`dots sdlc advance <id>` 人工跳过,会留痕。
+
+缺陷轨迹走同一条流水线,只是从修复开始:
+
+```bash
+dots sdlc new --track bugfix "导出接口 500" --jira OPS-77
+dots bugs fix <id1> <id2>     # 多条一起修,先按根因归类
+```
+
+## 本体库
+
+三层,各管各的:
+
+```text
+物理层   公司库里的表 / 集合 / 字段。只读。
+   ↓ dots ontology sync
+语义层   ontology/ontology.json:实体、字段、关系、枚举、术语。人可以手改。
+   ↓ dots ontology apply
+派生层   generated/:数据字典、ER 图、DDL、Python 模型、TS 类型
+```
+
+```bash
+dots ontology init              # 建一份空的
+dots ontology sync              # 采所有数据源并合并
+dots ontology sync crm          # 只采一个
+dots ontology show              # 实体列表
+dots ontology show orders       # 某个实体的完整定义
+dots ontology edit              # 用 $EDITOR 手改,存盘后自动校验 + 派生
+dots ontology apply             # 手改 JSON 之后重新生成
+dots ontology status            # 派生层是否落后
+```
+
+JSON 的形状(节选):
+
+```json
+{
+  "version": 1,
+  "entities": [
+    {
+      "id": "orders",
+      "label": "订单",
+      "status": "confirmed",
+      "curated": true,
+      "source": { "datasource": "crm", "schema": "public", "table": "orders" },
+      "primary_key": ["id"],
+      "fields": [
+        { "name": "status", "label": "状态", "semantic": "enum",
+          "enum": ["paid", "unpaid"], "nullable": false }
+      ],
+      "relations": [
+        { "field": "customer_id", "target": "customer", "kind": "many_to_one" }
+      ]
+    }
+  ],
+  "enums": [{ "id": "order_status", "values": [{ "value": "paid", "label": "已支付" }] }],
+  "glossary": [{ "term": "GMV", "definition": "成交总额" }]
+}
+```
+
+手改规则(有意不对称):
+
+- `curated: true` 的实体/字段,下一次 `sync` **不会覆盖**你的标注、枚举、关系;
+  库里新增的列只报冲突,不静默加进来。
+- 没改过的实体:字段跟着库走,新字段自动补。
+- 库里消失的表只标 `missing`,不删 —— 删了人工标注就没了。
+
+**改完之后全流程一起变**:
+
+- `generated/` 下的数据字典、`schema.sql`、`models.py`、`types.ts`、`er.mmd` 全部重写。
+- 每条流水线的每份 md 里,「数据模型(本体库自动生成)」那一节整段重写。
+- 系统提示里的本体摘要跟着变;阶段目标里也带着它,所以 next 阶段拿到的字段名是新的。
+- `dots ontology status` 会告诉你派生层是不是忘了 apply;手改过派生文件也会被点出来。
+
+## MCP:飞书 / Jira / Sigma / GitLab
+
+```bash
+dots mcp add jira       # 写一段现成配置进 dot.toml
+dots mcp add feishu
+dots mcp add gitlab
+dots mcp add sigma
+dots mcp list           # 看状态、缺哪个环境变量
+```
+
+`dots mcp add` 只会写变量名,凭据要 export:
+
+```bash
+export JIRA_URL=https://your-team.atlassian.net
+export JIRA_USERNAME=you@example.com
+export JIRA_API_TOKEN=...
+```
+
+工具名统一带前缀(`jira__create_issue`、`gitlab__create_merge_request`),
+所以审批规则可以按系统写通配:
+
+```toml
+[approval.rules]
+"jira__*" = "ask"
+"feishu__send_*" = "ask"
+"gitlab__create_*" = "deny"
+```
+
+- 没装适配器:`pip install 'dots-agent[mcp]'`。没装也不影响别的功能,tick 照跑。
+- 一个 server 连不上不影响其它 server,也不影响这一轮 tick。
+- 连一次很贵(要起 `npx` / `uvx` 子进程),同一进程内会缓存。
+
+## 微信群 BUG 监控
+
+dots **不登录微信**。桥把消息 append 到 `workspace/wechat/inbox.jsonl`,一行一条:
+
+```json
+{"group": "项目A-线上问题", "sender": "张三", "text": "订单导出报 500", "msg_id": "abc"}
+```
+
+桥可以是 Wechaty、wechatferry、企业微信机器人转发、桌面 RPA,甚至人工导出的聊天记录 ——
+只要往这个文件追加。换桥不用改 dots 一行代码。
+
+桥不方便写文件时,用内置本机 webhook(只听 `127.0.0.1`):
+
+```bash
+export DOT_WECHAT_TOKEN=change-me
+dots wechat hook --port 8790
+
+curl -X POST http://127.0.0.1:8790/wechat \
+  -H "Content-Type: application/json" -H "X-Dots-Token: change-me" \
+  -d '{"group":"项目A-线上问题","sender":"张三","text":"导出报 500"}'
+```
+
+一条群消息进来之后:
+
+1. **关键词判定**:报错 / 500 / 异常 / traceback / 崩溃 …… 闲聊不进台账。
+2. **指纹去重**:异常类型 + 顶部文件名、错误码、或归一化后的正文骨架。
+   同一条错换个措辞、换个行号还是同一个指纹 —— 群里十个人报不会开十个目标。
+3. **进台账**:`bugs` 表记次数、首末时间、样本;`dots bugs` 看全部。
+4. **派活**:新 BUG 自动起一条 `bugfix` 流水线(修 → 测 → 归档);
+   把 `[sdlc] auto_from_bug` 关掉就退化成普通目标。
+5. **回归**:已经修复/关闭的又出现,状态回 `open` 并重新开流水线,不会安静地留在已修复里。
+
+```bash
+dots wechat ingest "导出报 500" --group 项目A-线上问题 --sender 张三   # 联调用
+dots bugs
+dots bugs show <id>
+dots bugs fix <id1> <id2>
+dots bugs close <id>
+```
+
 ## 数据放在哪
 
 打包版的数据跟着配置文件走。默认全局配置下:
@@ -634,13 +909,16 @@ daily_token_budget = 0   # 0 = 不限。填了数字,超了当天就不再跑新
 ```text
 ~/.dots/
 ├── dot.toml          配置(密钥只写环境变量名)
-├── dot.db            目标、事件、审批、审计、对话 checkpoint
+├── dot.db            目标、事件、审批、缺陷台账、审计、对话 checkpoint
 ├── dot.db-wal        正常运行时存在
 ├── dot.db-shm        正常运行时存在
 └── workspace/        它的工作区 = 沙箱
     ├── inbox/        往里扔文件,它下一轮自己发现
     ├── skills/       它攒的技能,每份一个目录 + SKILL.md
-    └── ...
+    ├── ontology/     本体库:ontology.json + history/ 快照
+    ├── generated/    本体库派生的文档和代码(整体可重建,别手改)
+    ├── projects/     流水线,一条一个子目录(PRD/design/dev/test/fix/archive)
+    └── wechat/       群消息 spool(inbox.jsonl)
 ```
 
 在仓库里开发时,如果用的是仓库根的 `dot.toml`,数据就在仓库根下。
@@ -806,6 +1084,50 @@ dots init --global
 `resources/runtime/python/python.exe` 缺失,说明打包时 `extraResources` 没带上
 `desktop/runtime/`。重新执行 `bash make-runtime.sh` 再 `npm run dist`。
 
+### `dots ontology sync` 报「缺驱动」或连不上
+
+按库装驱动,都只在你真要采那个库时才需要:
+
+```bash
+pip install 'psycopg[binary]'   # postgres
+pip install pymysql             # mysql
+pip install pymongo             # mongodb
+```
+
+连接串只从 `dsn_env` 指的环境变量读。先在同一个终端 `export DOT_CRM_DSN=...` 再跑,
+不要把连接串写进 `dot.toml`。报「一个实体都没采到」时检查 `schema` / `database`
+和 `include` / `exclude` —— MySQL 的 schema 是库名,不是 `public`。
+
+### 改了本体库,但文档/代码没变
+
+`dots ontology status` 会告诉你派生层落后了没有。改 JSON 后跑 `dots ontology apply`;
+用 `dots ontology edit` 存盘会自动做这一步(校验不过则不会动派生文件)。
+派生文件本身别手改 —— 它整体可重建,手改会在 `status` 里被标成 `hand_edited`。
+
+### MCP 工具没出现在 agent 手里
+
+按顺序查:
+
+1. `dots mcp list` —— 有没有 server、是不是「就绪」、缺哪个环境变量;
+2. `pip install 'dots-agent[mcp]'` —— 适配器装了没;
+3. `[mcp] enabled = true` —— `dots mcp add` 会自动打开,手写配置时容易漏;
+4. `command` 里的 `npx` / `uvx` 在 PATH 里吗(飞书和 GitLab 要 Node,GitLab/Jira 要 uv);
+5. 工具名有前缀(`jira__create_issue`),审批规则别按裸名写。
+
+### 微信群消息没反应
+
+1. `dots wechat status` —— 源开没开、spool 在哪、读到的偏移是多少;
+2. 消息是不是进了 `groups` 白名单,文本是不是命中了报错关键词;
+3. 同一句话报第二遍不会开新目标(这是故意的):`dots bugs` 里看计数;
+4. 想联调不接桥:`dots wechat ingest "导出报 500" --group 项目A` 然后 `dots tick`。
+
+### 流水线卡在某一阶段
+
+`dots sdlc show <id>` 看「缺什么」那列:产物文件没落盘或少了必须的小节,阶段就不会推进。
+让 agent 再跑一次(`dots tick`),或者人工补文件;确实已经在别处做完了,
+用 `dots sdlc advance <id>` 跳过并留痕。两次都没落盘的话流水线会被标成 `blocked`,
+不会继续烧 token。
+
 ### 想彻底重来
 
 1. 关闭应用;
@@ -821,6 +1143,12 @@ dots init --global
 它要发邮件        → 待批横幅点「批准」或「拒绝」
 跟它说话          → 底部输入框,回车发送
 让它学一套流程    → 技能面板「学习」→ 等下一轮
+开一条流水线      → dots sdlc new "需求一句话"
+看流水线走到哪    → dots sdlc ls → dots sdlc show <id>
+采公司库元数据    → 配 [ontology.datasources.*] → dots ontology sync
+手改本体          → dots ontology edit → 存盘自动派生
+群里的 BUG        → dots bugs → dots bugs fix <id>
+接外部系统        → dots mcp add jira|feishu|gitlab|sigma
 换模型            → 改 ~/.dots/dot.toml 的 [model] → 重启应用
 出问题            → 顶栏「体检」→ 看输出面板 → 活动面板
 ```
