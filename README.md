@@ -70,9 +70,12 @@ release/dots-<版本>-setup.exe
 
 ```bash
 cd desktop
-bash make-runtime.sh      # 首次,或 dots/ 源码改动后
+python make-runtime.py    # 首次,或 dots/ 源码改动后(Windows 没 Bash 也能跑)
 npm run dist              # 生成 release/dots-<版本>-setup.exe
 ```
+
+> 有 Git Bash 的机器也可以用等价的 `bash make-runtime.sh`;
+> 两个脚本做的事一样(下载嵌入式 Python + pip --target + 拷贝 dots)。
 
 #### 在仓库里开发
 
@@ -1124,7 +1127,8 @@ dots init --global
 ### 装完启动报「安装包里没找到自带运行时」
 
 `resources/runtime/python/python.exe` 缺失,说明打包时 `extraResources` 没带上
-`desktop/runtime/`。重新执行 `bash make-runtime.sh` 再 `npm run dist`。
+`desktop/runtime/`。重新执行 `python make-runtime.py`(或 `bash make-runtime.sh`)
+再 `npm run dist`。
 
 ### `dots ontology sync` 报「缺驱动」或连不上
 

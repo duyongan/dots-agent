@@ -47,6 +47,8 @@ docs/
 # 本机联调用的临时配置和工作区
 .smoke/
 .tmp/
+# 打运行时依赖时 pip/uv 的临时目录
+.tmp-build/
 
 # ---- 编辑器 / 系统 ----
 .vscode/
