@@ -9,10 +9,13 @@ from __future__ import annotations
 import json
 import secrets
 import shutil
+import subprocess
+import sys
 import threading
 import time
 import urllib.error
 import urllib.request
+from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -28,7 +31,10 @@ def _cfg(tag: str = "wx") -> SimpleNamespace:
         db=root / "dot.db",
         sources=SimpleNamespace(
             wechat=SimpleNamespace(
-                enabled=True, spool="wechat/inbox.jsonl", groups=[], keywords=[],
+                enabled=True, backend="spool", library_path="",
+                python_exe="", collect_timeout=240,
+                collect_interval=300, max_pull=20,
+                spool="wechat/inbox.jsonl", groups=[], keywords=[],
                 interval=60, max_batch=100, token_env="X", token="",
             ),
         ),
@@ -208,6 +214,281 @@ def test_auto_pipeline() -> str:
         shutil.rmtree(cfg.root, ignore_errors=True)
 
 
+def _fake_pyweixin(running: bool = True):
+    """假的 pyweixin 包:形状照着真库(静态类 + 中文键),不碰 UI。"""
+    import types
+
+    class Tools:
+        @staticmethod
+        def is_weixin_running():
+            return running
+
+        @staticmethod
+        def get_weixin_hwnd():
+            return 123 if running else 0
+
+    class Messages:
+        calls: list[tuple[str, int]] = []
+        records = [
+            {"消息发送人": "张三", "消息内容": "订单导出报 500",
+             "消息类型": "文本", "消息发送时间": "2026年11月08日 14:30"},
+            {"消息发送人": "李四", "消息内容": "收到",
+             "消息类型": "文本", "消息发送时间": "2026年11月08日 14:31"},
+        ]
+
+        @staticmethod
+        def dump_chat_history(friend, number, **kwargs):
+            Messages.calls.append((friend, number))
+            return list(Messages.records)
+
+    utils = types.ModuleType("pyweixin.utils")
+    utils.scan_for_new_messages = lambda **kw: {
+        "项目A-线上问题": 3, "闲聊群": 1,
+    }
+    mod = types.ModuleType("pyweixin")
+    mod.__path__ = []          # 当成包,importlib 才会去 sys.modules 里找子模块
+    mod.Tools = Tools
+    mod.Messages = Messages
+    return mod, utils
+
+
+def _install_fake_pyweixin(running: bool = True):
+    mod, utils = _fake_pyweixin(running)
+    old = {k: sys.modules.get(k) for k in ("pyweixin", "pyweixin.utils")}
+    sys.modules["pyweixin"] = mod
+    sys.modules["pyweixin.utils"] = utils
+    wechat._SEEN.clear()
+    return mod, old
+
+
+def _restore_pyweixin(old: dict) -> None:
+    for key, value in old.items():
+        if value is None:
+            sys.modules.pop(key, None)
+        else:
+            sys.modules[key] = value
+    wechat._SEEN.clear()
+
+
+def test_pyweixin_time_and_normalize() -> str:
+    now = datetime(2026, 11, 8, 15, 0).timestamp()
+    assert abs(wechat.parse_cn_time("2026年11月08日 14:30", now=now)
+               - datetime(2026, 11, 8, 14, 30).timestamp()) < 1
+    assert abs(wechat.parse_cn_time("昨天 09:05", now=now)
+               - datetime(2026, 11, 7, 9, 5).timestamp()) < 1
+    assert abs(wechat.parse_cn_time("星期一 10:00", now=now)
+               - datetime(2026, 11, 2, 10, 0).timestamp()) < 1
+    assert wechat.parse_cn_time("", now=now) == 0.0
+
+    got = wechat.messages_from_pyweixin("项目A", [{
+        "消息发送人": "张三", "消息内容": "导出报 500",
+        "消息类型": "文本", "消息发送时间": "2026年11月08日 14:30",
+    }], now=now)
+    assert len(got) == 1
+    assert got[0].group == "项目A" and got[0].via == "pyweixin"
+    assert got[0].msg_id.startswith("wx")
+    assert got[0].msg_type == "文本"
+    assert wechat.messages_from_pyweixin("A", [{"消息内容": ""}]) == []
+
+    # 同一份记录归一化两次,msg_id 必须一样(去重靠它)
+    again = wechat.messages_from_pyweixin("项目A", [{
+        "消息发送人": "张三", "消息内容": "导出报 500",
+        "消息类型": "文本", "消息发送时间": "2026年11月08日 14:30",
+    }], now=now)
+    assert got[0].msg_id == again[0].msg_id
+    return "解析:微信时间戳(含昨天/星期)与记录归一化都稳定"
+
+
+def test_collect_with_fake_pyweixin() -> str:
+    cfg = _cfg("collect")
+    cfg.sources.wechat.backend = "pyweixin"
+    cfg.sources.wechat.groups = ["项目A-线上问题"]
+    cfg.sources.wechat.max_pull = 20
+    mod, old = _install_fake_pyweixin()
+    try:
+        res = wechat.collect(cfg)
+        assert not res.get("error"), res
+        assert res["chats"] == 1 and res["messages"] == 2, res
+        assert mod.Messages.calls == [("项目A-线上问题", 3)], mod.Messages.calls
+
+        lines = wechat.spool_path(cfg).read_text(encoding="utf-8").splitlines()
+        assert len(lines) == 2
+        first = json.loads(lines[0])
+        assert first["group"] == "项目A-线上问题" and first["via"] == "pyweixin"
+        assert first["msg_id"].startswith("wx")
+
+        # 同一批消息再采一次:进程内记住过,不再重复写
+        res2 = wechat.collect(cfg)
+        assert res2["messages"] == 0 and res2["skipped"] == 2, res2
+        assert len(wechat.spool_path(cfg).read_text(encoding="utf-8").splitlines()) == 2
+
+        # 不限分组时,未读的会话都采
+        cfg.sources.wechat.groups = []
+        wechat._SEEN.clear()
+        res3 = wechat.collect(cfg)
+        assert res3["chats"] == 2, res3
+        assert {c for c, _ in mod.Messages.calls} == {"项目A-线上问题", "闲聊群"}
+        return "采集:按分组/未读数拉消息,写进同一个 spool,重复不重写"
+    finally:
+        _restore_pyweixin(old)
+        shutil.rmtree(cfg.root, ignore_errors=True)
+
+
+def test_collect_reports_environment_errors() -> str:
+    cfg = _cfg("collecterr")
+    cfg.sources.wechat.backend = "pyweixin"
+    mod, old = _install_fake_pyweixin(running=False)
+    try:
+        res = wechat.collect(cfg)
+        assert res.get("error") and "微信没在运行" in res["error"], res
+        spool = wechat.spool_path(cfg)
+        assert not spool.exists() or spool.read_text(encoding="utf-8") == ""
+        return "采集:微信没启动时给一句人话,不抛异常"
+    finally:
+        _restore_pyweixin(old)
+        shutil.rmtree(cfg.root, ignore_errors=True)
+
+
+def test_worker_collect_is_rate_limited() -> str:
+    cfg = _cfg("rate")
+    cfg.sources.wechat.backend = "pyweixin"
+    cfg.sources.wechat.groups = ["项目A-线上问题"]
+    cfg.sources.wechat.collect_interval = 300
+    mod, old = _install_fake_pyweixin()
+    try:
+        conn = db.connect(cfg.db)
+        db.init(conn)
+        try:
+            stats = {"wechat_collected": 0, "wechat_errors": 0}
+            worker._maybe_collect_wechat(cfg, conn, stats)
+            assert stats["wechat_collected"] == 2, stats
+            assert db.meta_get(conn, "wechat:collect_at"), "应记下采集时间"
+            calls = len(mod.Messages.calls)
+
+            # 间隔没到,不再动 UI
+            worker._maybe_collect_wechat(cfg, conn, stats)
+            assert len(mod.Messages.calls) == calls
+            assert stats["wechat_collected"] == 2
+
+            # 关掉源就不采
+            cfg.sources.wechat.enabled = False
+            worker._maybe_collect_wechat(cfg, conn, stats)
+            assert len(mod.Messages.calls) == calls
+        finally:
+            conn.close()
+        return "调度:采集按 collect_interval 限频,关掉源就完全不碰微信"
+    finally:
+        _restore_pyweixin(old)
+        shutil.rmtree(cfg.root, ignore_errors=True)
+
+
+def test_worker_collect_error_is_audited() -> str:
+    cfg = _cfg("rateerr")
+    cfg.sources.wechat.backend = "pyweixin"
+    mod, old = _install_fake_pyweixin(running=False)
+    try:
+        conn = db.connect(cfg.db)
+        db.init(conn)
+        try:
+            stats = {"wechat_collected": 0, "wechat_errors": 0}
+            worker._maybe_collect_wechat(cfg, conn, stats)
+            assert stats["wechat_errors"] == 1
+            kinds = [r["kind"] for r in db.recent_audit(conn, 10)]
+            assert "wechat_collect_error" in kinds, kinds
+        finally:
+            conn.close()
+        return "失败:采集出错只记 audit,不拖垮这一轮 tick"
+    finally:
+        _restore_pyweixin(old)
+        shutil.rmtree(cfg.root, ignore_errors=True)
+
+
+def _make_fake_lib(root: Path) -> Path:
+    """在磁盘上造一个假 pyweixin 包,给「子进程采集」那条路用。"""
+    pkg = root / "fakelib" / "pyweixin"
+    pkg.mkdir(parents=True, exist_ok=True)
+    (pkg / "__init__.py").write_text(
+        "from .WeChatAuto import Tools, Messages\nfrom . import utils\n",
+        encoding="utf-8")
+    (pkg / "WeChatAuto.py").write_text(
+        "class Tools:\n"
+        "    @staticmethod\n"
+        "    def is_weixin_running():\n"
+        "        return True\n"
+        "    @staticmethod\n"
+        "    def get_weixin_hwnd():\n"
+        "        return 0\n"
+        "\n"
+        "class Messages:\n"
+        "    @staticmethod\n"
+        "    def dump_chat_history(friend, number, **kw):\n"
+        "        return [{'消息发送人': '张三', '消息内容': '订单导出报 500',\n"
+        "                 '消息类型': '文本', '消息发送时间': '2026年11月08日 14:30'}]\n",
+        encoding="utf-8")
+    (pkg / "utils.py").write_text(
+        "def scan_for_new_messages(**kw):\n"
+        "    return {'项目A-线上问题': 2, '闲聊群': 1}\n",
+        encoding="utf-8")
+    return root / "fakelib"
+
+
+def test_collector_script_protocol() -> str:
+    """独立采集脚本:只认 pyweixin,结果写 JSON 文件,不靠 stdout。"""
+    cfg = _cfg("script")
+    lib = _make_fake_lib(cfg.root)
+    script = Path(wechat.__file__).with_name("rpa_collector.py")
+    out = cfg.root / "collect.json"
+    try:
+        proc = subprocess.run(
+            [sys.executable, str(script), "--out", str(out),
+             "--library-path", str(lib), "--groups", "项目A-线上问题",
+             "--max-pull", "5"],
+            capture_output=True, text=True, timeout=60,
+        )
+        assert proc.returncode == 0, (proc.returncode, proc.stderr[-500:])
+        payload = json.loads(out.read_text(encoding="utf-8"))
+        assert payload["unread"] == {"项目A-线上问题": 2, "闲聊群": 1}, payload
+        assert list(payload["chats"]) == ["项目A-线上问题"], payload
+        assert payload["chats"]["项目A-线上问题"][0]["消息内容"] == "订单导出报 500"
+
+        # --check:假包没有微信窗口,应该给出可读结论而不是抛栈
+        check_out = cfg.root / "check.json"
+        subprocess.run(
+            [sys.executable, str(script), "--out", str(check_out),
+             "--library-path", str(lib), "--check"],
+            capture_output=True, text=True, timeout=60,
+        )
+        result = json.loads(check_out.read_text(encoding="utf-8"))
+        assert result["ok"] is False and "找不到微信窗口" in result["detail"], result
+        return "脚本:未读扫描/取记录/环境检查的 JSON 协议都能独立跑"
+    finally:
+        shutil.rmtree(cfg.root, ignore_errors=True)
+
+
+def test_collect_via_subprocess() -> str:
+    """配了 python_exe 就走子进程:dots 和 pyweixin 的依赖可以不在一个环境。"""
+    cfg = _cfg("subproc")
+    cfg.sources.wechat.backend = "pyweixin"
+    cfg.sources.wechat.groups = ["项目A-线上问题"]
+    cfg.sources.wechat.python_exe = sys.executable
+    cfg.sources.wechat.collect_timeout = 60
+    cfg.sources.wechat.library_path = str(_make_fake_lib(cfg.root))
+    try:
+        res = wechat.collect(cfg)
+        assert not res.get("error"), res
+        assert res["messages"] == 1, res
+        lines = wechat.spool_path(cfg).read_text(encoding="utf-8").splitlines()
+        assert len(lines) == 1
+        msg = json.loads(lines[0])
+        assert msg["group"] == "项目A-线上问题" and msg["via"] == "pyweixin"
+
+        res2 = wechat.collect(cfg)
+        assert res2["messages"] == 0 and res2["skipped"] == 1, res2
+        return "子进程:换解释器采集也能落到同一个 spool,重复消息不重写"
+    finally:
+        shutil.rmtree(cfg.root, ignore_errors=True)
+
+
 def run() -> str:
     notes = [
         test_spool_incremental(),
@@ -215,6 +496,13 @@ def run() -> str:
         test_webhook(),
         test_route_dedupes_into_one_goal(),
         test_auto_pipeline(),
+        test_pyweixin_time_and_normalize(),
+        test_collect_with_fake_pyweixin(),
+        test_collect_reports_environment_errors(),
+        test_worker_collect_is_rate_limited(),
+        test_worker_collect_error_is_audited(),
+        test_collector_script_protocol(),
+        test_collect_via_subprocess(),
     ]
     return "微信群:" + ";".join(notes)
 

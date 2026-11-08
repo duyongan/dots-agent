@@ -45,9 +45,13 @@ def tick(cfg, conn, agents, *, dry_run: bool = False) -> dict:
         "resumed": 0, "ran": 0, "interrupted": 0, "failed": 0,
         "handoffs": 0, "skipped": 0, "paused": None,
         "bugs_new": 0, "bugs_repeat": 0, "sdlc": 0,
+        "wechat_collected": 0, "wechat_errors": 0,
     }
     # tick 可以脱离 serve 单独跑(测试和 `dots tick` 都走这条路)
     graph.use_or_create(cfg, conn)
+
+    # 0. pyweixin 直接采集(配了才跑)。放在收事件之前 —— 采完立刻就能被同一轮读走。
+    _maybe_collect_wechat(cfg, conn, stats)
 
     # 1. 收事件
     for e in sources.poll_all(cfg, conn):
@@ -115,6 +119,53 @@ def tick(cfg, conn, agents, *, dry_run: bool = False) -> dict:
         _run(cfg, conn, agents, goal, dry_run=dry_run, stats=stats)
 
     return stats
+
+
+# ----------------------------------------------------------------- 微信群采集
+
+def _maybe_collect_wechat(cfg, conn, stats: dict) -> None:
+    """backend = pyweixin 时,按 collect_interval 采一次群消息写进 spool。
+
+    采集放在 worker 而不是 sources:sources 只读外部世界、绝不写数据库,
+    而"上次什么时候采的"要记在 meta 里。UI 自动化会动微信窗口,所以有独立间隔,
+    不跟着 tick 每轮跑。
+
+    任何失败都只记 audit —— RPA 的失败是可预期的(没登录、窗口被关、控件找不到),
+    不能让一整轮 tick 因为微信没开就停摆。
+    """
+    sub = getattr(getattr(cfg, "sources", None), "wechat", None)
+    if sub is None or not getattr(sub, "enabled", False):
+        return
+    if str(getattr(sub, "backend", "spool") or "spool") != "pyweixin":
+        return
+
+    interval = float(getattr(sub, "collect_interval", 300) or 300)
+    last = float(db.meta_get(conn, "wechat:collect_at", "0") or 0)
+    if time.time() - last < interval:
+        return
+    # 先记时间再采:失败也不要每轮重试,否则微信没登录时每个 tick 都去敲 UI
+    db.meta_set(conn, "wechat:collect_at", str(time.time()))
+
+    try:
+        from dots import wechat as wechat_mod
+
+        result = wechat_mod.collect(cfg)
+    except Exception as e:                  # noqa: BLE001 - RPA 异常类型很杂
+        db.audit(conn, None, "wechat_collect_error", f"{type(e).__name__}: {e}")
+        stats["wechat_errors"] += 1
+        return
+
+    if result.get("error"):
+        db.audit(conn, None, "wechat_collect_error", str(result["error"])[:500])
+        stats["wechat_errors"] += 1
+        print(f"[dot] 微信群采集失败:{result['error']}", file=sys.stderr)
+        return
+
+    count = int(result.get("messages") or 0)
+    stats["wechat_collected"] += count
+    db.audit(conn, None, "wechat_collect",
+             f"{result.get('chats')} 个会话 -> {count} 条"
+             f"(跳过重复 {result.get('skipped') or 0})")
 
 
 def _route_wechat(cfg, conn, row, payload: dict, stats: dict) -> None:
@@ -528,6 +579,7 @@ def summarize(stats: dict) -> str:
         ("resumed", "续跑"), ("ran", "跑完"), ("handoffs", "交接"),
         ("interrupted", "等审批"), ("failed", "失败"),
         ("bugs_new", "新 BUG"), ("bugs_repeat", "重复报告"), ("sdlc", "流水线推进"),
+        ("wechat_collected", "群消息采集"), ("wechat_errors", "采集失败"),
     ):
         if stats.get(key):
             bits.append(f"{label} {stats[key]}")

@@ -134,15 +134,31 @@ class ICalSubject:
 
 @dataclass
 class WeChatSubject:
-    """微信群监控。消息由外部桥(Wechaty/wechatferry/RPA)写进 spool,这里只读。
+    """微信群监控。两种采集方式,同一份 spool 契约。
 
-    这样做的好处:读群消息的脏活(登录、风控、UI 自动化)留在桥里,
-    dots 只认一个追加写的 JSONL 文件。桥挂了、换了,这边一行不用改。
+    backend = "spool"    消息由外部桥写进 JSONL,dots 只读(默认,零依赖)。
+    backend = "pyweixin" 直接用本机微信 UI 自动化采:扫未读会话 -> 打开会话取消息
+                         -> 追加进同一个 spool。需要 Windows + 已登录的微信 4.x,
+                         以及 pyweixin 源码目录(见 library_path)。
+
+    两种方式最终都落到同一个 inbox.jsonl,所以下游(过滤、指纹、台账、流水线)
+    一行都不用改;换采集方式只改一个配置。
     """
     enabled: bool = False
-    # workspace 下的相对路径。JSONL,一行一条消息,由桥 append。
+    backend: str = "spool"
+    # pyweixin 源码目录(形如 <pywechat>/src);空 = 用已安装进环境的 pyweixin
+    library_path: str = ""
+    # 用哪个解释器跑采集。留空 = 当前进程内直接 import(要求本环境装齐 pyweixin 依赖);
+    # 填了就起子进程 —— dots 依赖 langchain,pyweixin 依赖 pywinauto,常常不在同一个环境。
+    python_exe: str = ""
+    # 子进程采集超时(秒)。UI 自动化慢,给足;超时只当这次采集失败。
+    collect_timeout: int = 240
+    # pyweixin 采集间隔(秒)。UI 自动化会动窗口,别跟 tick 一样勤。
+    collect_interval: int = 300
+    # 每个会话一次最多拉多少条,防止一次开一堆窗口
+    max_pull: int = 20
     spool: str = "wechat/inbox.jsonl"
-    # 只看这些群。空 = 全部群。
+    # 只看这些群。空 = 全部会话(含私聊,按备注匹配)。
     groups: list[str] = field(default_factory=list)
     # 判定「这是 BUG」的关键词。空 = 用 bugs.DEFAULT_KEYWORDS。
     keywords: list[str] = field(default_factory=list)
@@ -359,6 +375,12 @@ def load(path: str | Path | None = None) -> Config:
         ),
         wechat=WeChatSubject(
             enabled=bool(w.get("enabled", False)),
+            backend=_wechat_backend(w.get("backend", "spool")),
+            library_path=str(w.get("library_path", "")),
+            python_exe=str(w.get("python_exe", "")),
+            collect_timeout=int(w.get("collect_timeout", 240)),
+            collect_interval=int(w.get("collect_interval", 300)),
+            max_pull=int(w.get("max_pull", 20)),
             spool=str(w.get("spool", "wechat/inbox.jsonl")).strip("/") or "wechat/inbox.jsonl",
             groups=[str(x) for x in (w.get("groups") or [])],
             keywords=[str(x) for x in (w.get("keywords") or [])],
@@ -468,6 +490,16 @@ def load(path: str | Path | None = None) -> Config:
         ontology=ontology,
         sdlc=sdlc,
     )
+
+
+_WECHAT_BACKENDS = {"spool": "spool", "pyweixin": "pyweixin", "rpa": "pyweixin",
+                    "pywechat": "pyweixin", "wechat": "pyweixin"}
+
+
+def _wechat_backend(value) -> str:
+    """采集方式归一。写 rpa / pywechat 也认,认不出来就退回 spool(不会静默连不上)。"""
+    text = str(value or "").strip().lower()
+    return _WECHAT_BACKENDS.get(text, "spool")
 
 
 _DB_KIND_ALIASES = {

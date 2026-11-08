@@ -111,6 +111,10 @@ def _parser() -> argparse.ArgumentParser:
     wx_in.add_argument("--sender", default="")
     wx_hook = wx_sub.add_parser("hook", help="起本机 webhook,接收桥推来的消息")
     wx_hook.add_argument("--port", type=int, default=8790)
+    wx_col = wx_sub.add_parser("collect", help="用本机微信 UI 自动化采一次群消息")
+    wx_col.add_argument("--chat", action="append", default=[],
+                        help="只采这个会话(可重复);默认按 groups 配置")
+    wx_sub.add_parser("check", help="检查 pyweixin / 微信登录 / UI 可见性")
     wx_sub.add_parser("status", help="spool 在哪、读到哪了")
 
     s = sub.add_parser("ls", help="列目标")
@@ -925,18 +929,57 @@ def _cmd_wechat(args, cfg) -> int:
         wechat_mod.serve_forever(cfg, port=args.port)
         return 0
 
+    if args.wechat_cmd == "collect":
+        res = wechat_mod.collect(cfg, chats=args.chat or None)
+        if res.get("error"):
+            print(f"采集失败:{res['error']}", file=sys.stderr)
+            print("先跑 dots wechat check 看环境。", file=sys.stderr)
+            return 1
+        print(f"{res['chats']} 个会话 -> 写入 {res['messages']} 条"
+              f"(跳过重复 {res['skipped']},未读总数 {res['unread_total']})")
+        for chat, detail in (res.get("detail") or {}).items():
+            print(f"  {chat}: {detail}")
+        print(f"spool:{wechat_mod.spool_path(cfg)}")
+        print("下一轮 tick 会读它;先看会不会被认成 BUG:dots bugs")
+        return 0
+
+    if args.wechat_cmd == "check":
+        ok, detail = wechat_mod.check_env(cfg)
+        print(("✓ " if ok else "✗ ") + detail)
+        if not ok:
+            print("  -> 依赖:pip install 'dots-agent[wechat]'(pywinauto/pyautogui/pywin32)")
+            print("  -> 源码:在 [sources.wechat] 里配 library_path(指向 pywechat/src)")
+            return 1
+        return 0
+
     if args.wechat_cmd == "status":
         sub = cfg.sources.wechat
         p = wechat_mod.spool_path(cfg)
         size = p.stat().st_size if p.exists() else 0
         print(f"源:      {'开' if sub.enabled else '关'}([sources.wechat] enabled)")
+        print(f"采集:    {sub.backend}"
+              + (f"  {sub.library_path}" if sub.library_path else "")
+              + (f"  每 {sub.collect_interval}s" if sub.backend == "pyweixin" else ""))
         print(f"spool:   {p}({size} 字节)")
         print(f"读到:    {db_cursor(cfg)}")
+        if sub.backend == "pyweixin":
+            print(f"上次采集:{db_meta(cfg, 'wechat:collect_at') or '还没采过'}")
         print(f"分组:    {', '.join(sub.groups) if sub.groups else '全部'}")
         print(f"关键词:  {', '.join(sub.keywords) if sub.keywords else '内置默认'}")
-        print(f"webhook: python -m dots wechat hook --port 8790")
+        print("webhook: python -m dots wechat hook --port 8790")
         return 0
     return 2
+
+
+def db_meta(cfg, key: str) -> str:
+    try:
+        conn = db.connect(cfg.db)
+    except Exception:
+        return ""
+    try:
+        return db.meta_get(conn, key, "") or ""
+    finally:
+        conn.close()
 
 
 def db_cursor(cfg) -> str:
@@ -1082,12 +1125,17 @@ def _cmd_doctor(args) -> int:
 
     if cfg.sources.wechat.enabled:
         from dots import wechat as wechat_mod
+        sub = cfg.sources.wechat
         p = wechat_mod.spool_path(cfg)
         if p.exists():
             check("微信群 spool", True, f"{p}({p.stat().st_size} 字节)")
         else:
             check("微信群 spool", False, f"{p} 还不存在",
-                  "跑一次 dots wechat status,或者让桥先写一条")
+                  "跑一次 dots wechat collect,或者让桥先写一条")
+        if sub.backend == "pyweixin":
+            ok, detail = wechat_mod.check_env(cfg)
+            check("微信群采集(pyweixin)", ok, detail,
+                  "dots wechat check 看细节;依赖 pywinauto / pywin32 / psutil")
 
     print()
     if ok_all:

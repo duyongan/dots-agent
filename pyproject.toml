@@ -36,6 +36,14 @@ test = ["cryptography>=41", "pytest>=8"]
 mcp = ["langchain-mcp-adapters>=0.1"]
 # 本体库采集元数据。按你要采的库装其中几个即可,不装就只能手工写本体。
 ontology = ["psycopg[binary]>=3.1", "pymysql>=1.1", "pymongo>=4.6"]
+# 微信群 UI 自动化采集要用 pyweixin(源码见 pywechat 仓库),这里只带它依赖的系统库。
+# 仅 Windows 有意义;非 Windows 装得上也用不了。
+wechat = [
+    "pywinauto>=0.6.8; sys_platform == 'win32'",
+    "pyautogui>=0.9.54; sys_platform == 'win32'",
+    "pywin32>=308; sys_platform == 'win32'",
+    "psutil>=5.9",
+]
 
 [project.scripts]
 dots = "dots.cli:main"

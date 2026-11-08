@@ -36,7 +36,7 @@ python -m dots sdlc ls / show <id> / sync / advance <id>
 python -m dots ontology init / sync [数据源] / show [实体] / edit / apply / status
 python -m dots mcp list / add jira|feishu|gitlab|sigma
 python -m dots bugs [ls|show|close|fix]
-python -m dots wechat ingest|hook|status
+python -m dots wechat ingest|collect|check|hook|status
 ```
 
 pytest 会报一批 `PytestReturnNotNoneWarning`,这是**预期的**:每个用例 return 一句中文结论,
@@ -159,14 +159,27 @@ description 每轮都进系统提示并**被截断在 60 字符**,所以校验�
 - `langchain-mcp-adapters` 是可选依赖:没装只返回一句说明,`load_tools()` 绝不抛。
 - 连接很贵(npx/uvx 子进程),按连接参数缓存;一个 server 连不上不能拖垮其它 server,也不能拖垮 tick。
 
-### 微信群 + 缺陷(bugs.py + wechat.py)
+### 微信群 + 缺陷(bugs.py + wechat.py + rpa_collector.py)
 
-- dots **不登录微信**。桥往 `workspace/wechat/inbox.jsonl` 追加 JSONL,`wechat.read_new()`
-  按字节偏移读增量,半行留到下次(桥写一半时不能吃掉)。轮转(文件变短)就从头读,事件表 UNIQUE 兜重复。
-- 判定和去重不在源里:`sources.wechat_poll()` 只按分组/关键词过滤,`worker._route_wechat()`
-  才做 `bugs.record()` -> 台账 -> 决定开不开目标/流水线。
+- 消息有两种采法,最终都落到 `workspace/wechat/inbox.jsonl`:
+  - `backend = "pyweixin"`:用本机微信 UI 自动化(用户指定的 pywechat 仓库里的
+    `pyweixin`)扫未读会话、拉消息。采集入口是 `wechat.collect()`,由
+    `worker._maybe_collect_wechat()` 按 `collect_interval` 触发(时间记在 meta)。
+  - `backend = "spool"`:外部桥 / webhook / `dots wechat ingest` 直接写文件。
+- `dots` 要 langchain、`pyweixin` 要 pywinauto,两套依赖常常不在同一个解释器里。
+  所以 `[sources.wechat] python_exe` 如果填了,采集走**子进程**
+  `dots/rpa_collector.py`(只 import pyweixin,不 import dots),结果写 JSON 文件回传;
+  没填就在当前进程内 import。`rpa_collector.py` 是独立脚本,别让它依赖 dots 的任何东西。
+- UI 自动化会动窗口,所以采集有独立间隔;失败(没登录/窗口被关/控件找不到)只记
+  `wechat_collect_error` 的 audit,绝不能让 tick 崩。
+- dots **不登录微信**:这一步是 UI 自动化,不是协议客户端,没有 hook/注入。
+- `wechat.read_new()` 按字节偏移读增量,半行留到下次(写一半时不能吃掉)。轮转就从头读,
+  事件表 UNIQUE 兜重复。判定和去重不在源里:`sources.wechat_poll()` 只按分组/关键词过滤,
+  `worker._route_wechat()` 才做 `bugs.record()` -> 台账 -> 决定开不开目标/流水线。
 - 指纹优先用「异常类型 + 顶部文件名」,其次错误码,最后归一化正文。
   **不要加入行号** —— 行号随代码漂移,拿它当指纹等于每次都新报一条。
+- pyweixin 的记录没有消息 ID,`messages_from_pyweixin()` 用
+  `会话+发送人+时间+内容` 算一个稳定 `msg_id`;时间解析在 `parse_cn_time()`(昨天/星期/纯时分)。
 - webhook 只听 127.0.0.1,`token_env` 为空时不校验;别改成对外 host。
 
 ### 配置(config.py 是唯一读 dot.toml 的地方)

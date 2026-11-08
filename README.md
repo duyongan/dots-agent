@@ -11,7 +11,8 @@
 - **本体库**:从公司库(PG / MySQL / Mongo)采元数据,存成一份可以手改的 JSON,
   再派生文档和代码;改完一条命令,全流程的文档和代码一起变。见 [本体库](#本体库)。
 - **MCP**:飞书、Jira、Sigma、GitLab 的工具直接挂到手上,走同一套审批闸门。见 [MCP](#mcp飞书--jira--sigma--gitlab)。
-- **微信群 BUG 监控**:群里的报错自动去重、进台账、开修复流水线。见 [微信群 BUG 监控](#微信群-bug-监控)。
+- **微信群 BUG 监控**:用本机微信 UI 自动化(pyweixin)扫群,或让桥写 spool;
+  报错自动去重、进台账、开修复流水线。见 [微信群 BUG 监控](#微信群-bug-监控)。
 
 ## 安装
 
@@ -493,6 +494,8 @@ dots gui
 | `dots bugs fix <id>...` | 给一条或多条缺陷开修复流水线 |
 | `dots bugs close <id>` | 关掉一条缺陷 |
 | `dots wechat ingest "..."` | 手动灌一条群消息(补录 / 联调) |
+| `dots wechat collect` | 用本机微信 UI 自动化采一次群消息 |
+| `dots wechat check` | 检查 pyweixin / 微信登录 / UI 可见性 |
 | `dots wechat hook --port 8790` | 起本机 webhook,接收桥推来的消息 |
 | `dots wechat status` | spool 在哪、读到哪了 |
 | `dots selftest` | 不联网不调模型跑一遍自检 |
@@ -638,8 +641,14 @@ daily_token_budget = 0   # 0 = 不限。填了数字,超了当天就不再跑新
 ```toml
 [sources.wechat]
 enabled = false
-spool = "wechat/inbox.jsonl"   # 桥往这里 append,一行一条 JSON
-groups = []                    # 空 = 全部群;["项目A-线上问题"] = 只看这些群
+backend = "spool"              # spool | pyweixin
+library_path = ""              # pyweixin 源码目录(pywechat/src)
+python_exe = ""                # 采集用哪个解释器;留空 = 当前进程
+collect_timeout = 240          # 子进程采集超时(秒)
+collect_interval = 300         # pyweixin 采集间隔(秒)
+max_pull = 20                  # 每个会话一次最多拉多少条
+spool = "wechat/inbox.jsonl"   # 两种方式共同的落地文件
+groups = []                    # 空 = 全部会话;["项目A-线上问题"] = 只看这些群
 keywords = []                  # 空 = 内置的报错关键词
 interval = 60
 max_batch = 100                # 一次最多读多少条新消息
@@ -864,14 +873,47 @@ export JIRA_API_TOKEN=...
 
 ## 微信群 BUG 监控
 
-dots **不登录微信**。桥把消息 append 到 `workspace/wechat/inbox.jsonl`,一行一条:
+两种采集方式,消息最终都落到同一个 `workspace/wechat/inbox.jsonl`:
+
+**方式一(推荐,直接用本机微信)**:用 [pywechat](https://github.com/Hello-Mr-Crab/pywechat)
+里的 `pyweixin` 做 UI 自动化 —— 扫未读会话 → 打开对应群拉最新消息 → 写进 spool。
+
+```toml
+[sources.wechat]
+enabled = true
+backend = "pyweixin"
+# pywechat 仓库里的源码目录
+library_path = "C:/Users/you/Documents/project/pywechat/src"
+# 用哪个解释器跑采集。留空 = 当前进程内 import;填了就起子进程
+python_exe = "C:/Users/you/anaconda3/python.exe"
+collect_interval = 300     # 每 5 分钟扫一次
+max_pull = 20              # 每个群一次最多拉 20 条
+groups = ["项目A-线上问题"]  # 按微信备注名精确匹配;空 = 全部会话
+```
+
+```bash
+dots wechat check      # 微信在跑吗、登录了吗、UI 树可见吗
+dots wechat collect    # 立刻采一次(--chat 群名 只采一个)
+dots wechat status     # 看 backend / spool / 上次采集时间
+```
+
+要点:
+
+- **dot 和 pyweixin 的依赖可以不在同一个 Python 环境**。dots 要 langchain,
+  pyweixin 要 pywinauto/pyautogui;`python_exe` 填能跑 pyweixin 的那个解释器,
+  采集就走子进程,崩了也不会带倒常驻 agent。
+- 依赖:`pip install 'dots-agent[wechat]'`(或按 pywechat 仓库的
+  `scripts/requirements.txt` 装全),微信 4.x + Windows 10/11。
+- 微信的 UI 树必须可见(开启 Windows 无障碍/讲述人),否则自动化取不到控件。
+- `collect_interval` 是独立于 tick 的:UI 自动化会动窗口,不要每轮都扫。
+- 不用 `pyweixin` 就 `backend = "spool"`,消息由桥(Wechaty / wechatferry /
+  企业微信机器人 / 人工导出)写进同一个文件,下游完全一样。
+
+spool 的格式(一行一条 JSON,`msg_id` 有就去重、没有就按内容算):
 
 ```json
 {"group": "项目A-线上问题", "sender": "张三", "text": "订单导出报 500", "msg_id": "abc"}
 ```
-
-桥可以是 Wechaty、wechatferry、企业微信机器人转发、桌面 RPA,甚至人工导出的聊天记录 ——
-只要往这个文件追加。换桥不用改 dots 一行代码。
 
 桥不方便写文件时,用内置本机 webhook(只听 `127.0.0.1`):
 
@@ -1116,10 +1158,14 @@ pip install pymongo             # mongodb
 
 ### 微信群消息没反应
 
-1. `dots wechat status` —— 源开没开、spool 在哪、读到的偏移是多少;
-2. 消息是不是进了 `groups` 白名单,文本是不是命中了报错关键词;
-3. 同一句话报第二遍不会开新目标(这是故意的):`dots bugs` 里看计数;
-4. 想联调不接桥:`dots wechat ingest "导出报 500" --group 项目A` 然后 `dots tick`。
+先看是哪条路:
+
+1. `dots wechat status` —— 源开没开、backend 是什么、spool 在哪、读到的偏移是多少;
+2. `backend = "pyweixin"` 时先跑 `dots wechat check`:微信没登录 / UI 树不可见 /
+   `library_path` 指错 / `python_exe` 里没装 pywinauto,都会在这一步说清楚;
+3. 消息是不是进了 `groups` 白名单,文本是不是命中了报错关键词;
+4. 同一句话报第二遍不会开新目标(这是故意的):`dots bugs` 里看计数;
+5. 想联调不接微信:`dots wechat ingest "导出报 500" --group 项目A` 然后 `dots tick`。
 
 ### 流水线卡在某一阶段
 
@@ -1147,7 +1193,7 @@ pip install pymongo             # mongodb
 看流水线走到哪    → dots sdlc ls → dots sdlc show <id>
 采公司库元数据    → 配 [ontology.datasources.*] → dots ontology sync
 手改本体          → dots ontology edit → 存盘自动派生
-群里的 BUG        → dots bugs → dots bugs fix <id>
+群里的 BUG        → dots wechat check → dots bugs → dots bugs fix <id>
 接外部系统        → dots mcp add jira|feishu|gitlab|sigma
 换模型            → 改 ~/.dots/dot.toml 的 [model] → 重启应用
 出问题            → 顶栏「体检」→ 看输出面板 → 活动面板

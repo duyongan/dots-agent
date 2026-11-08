@@ -58,12 +58,24 @@ url = ""
 interval = 900
 
 [sources.wechat]
-# 微信群 BUG 监控。dots 不直接登录微信 —— 消息由桥(Wechaty / wechatferry /
-# 桌面 RPA)写进 spool,一行一条 JSON,这里只做增量读、关键词判定和去重。
-# 桥怎么接见 README 的「微信群监控」一节;换桥不用改 dots 一行代码。
+# 微信群 BUG 监控。两种采集方式,落到同一个 inbox.jsonl:
+#   backend = "spool"     外部桥(Wechaty / wechatferry / 机器人转发)往 spool 追加
+#   backend = "pyweixin"  直接用本机微信 UI 自动化采(Windows + 微信 4.x + pyweixin)
+# dots 只读 spool,所以换采集方式不用改下游一行代码。
 enabled = false
+backend = "spool"
+# pyweixin 源码目录(例如 "C:/Users/you/Documents/project/pywechat/src");
+# 留空 = 用已经装进当前 Python 环境的 pyweixin
+library_path = ""
+# 采集用哪个解释器。留空 = 当前进程内 import;填了就起子进程。
+# dots 要 langchain、pyweixin 要 pywinauto,经常不在同一个环境里,填上更稳。
+python_exe = ""
+collect_timeout = 240        # 子进程采集超时(秒)
+# pyweixin 采集间隔(秒)。UI 自动化会动窗口,别跟 tick 一样勤
+collect_interval = 300
+max_pull = 20                # 每个会话一次最多拉多少条
 spool = "wechat/inbox.jsonl"
-groups = []                  # 空 = 全部群;["项目A-线上问题"] = 只看这些群
+groups = []                  # 空 = 全部会话(按微信备注名精确匹配)
 keywords = []                # 空 = 用内置的报错关键词
 interval = 60
 max_batch = 100              # 一次最多读多少条新消息
